@@ -1,0 +1,34 @@
+[Unit]
+Description=Processd process manager
+Documentation=https://github.com/curruwilla/processd
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/processd serve --config /etc/processd/processd.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Must exceed shutdown_grace (default 30s), otherwise systemd kills the daemon
+# in the middle of stopping the processes it supervises.
+TimeoutStopSec=45s
+
+# mixed: systemd signals the daemon only, leaving it to terminate the process
+# groups it owns in the right order.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# The daemon needs privileges to drop them: it starts each process as the user
+# the worker declares.
+User=root
+StateDirectory=processd
+LogsDirectory=processd
+
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

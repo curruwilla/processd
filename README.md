@@ -11,9 +11,25 @@ Fica no espaço entre supervisores locais (Supervisor, PM2) e orquestradores dis
 
 ## Status
 
-**Pré-alpha — em especificação. Nenhum código implementado ainda.**
+**Pré-alpha.** O esqueleto em Go existe e compila; o daemon sobe, autentica e valida requisições,
+mas ainda não executa processos — persistência, fila e supervisão estão como stubs marcados com
+`TODO(spec §…)`.
 
-Os exemplos abaixo descrevem o comportamento **especificado**, não o entregue.
+| Área | Estado |
+|---|---|
+| API REST, auth por token, contrato de erro | implementado |
+| Config do daemon e workers (YAML estrito) | implementado |
+| Validação de params e montagem de argv | implementado |
+| Execução: process group, uid/gid, env limpo, sinais, timeout | implementado |
+| Captura de logs por tentativa com limite de tamanho | implementado |
+| Fingerprint `(pid, starttime)` contra reciclagem de PID | implementado |
+| Backoff com jitter, contagem de slots | implementado |
+| Máquina de estados | implementada |
+| Persistência SQLite (schema e migrations prontos, CRUD pendente) | **pendente** |
+| Scheduler, fila, locks | **pendente** |
+| Supervisão de execuções, retry, reconciliação | **pendente** |
+| Leitura de logs pela API | **pendente** |
+
 A spec completa está em **[docs/SPEC.md](docs/SPEC.md)**.
 
 ---
@@ -35,7 +51,7 @@ Não substitui o systemd para serviços de sistema.
 
 ---
 
-## Uso (planejado)
+## Uso
 
 Define um worker:
 
@@ -77,10 +93,47 @@ curl -X POST http://127.0.0.1:7373/v1/processes \
 Acompanha:
 
 ```bash
+processd status
+processd workers
 processd ps
-processd logs proc_01KABCDEF... -f
+processd logs proc_01KABCDEF...
 processd stop proc_01KABCDEF...
 ```
+
+Hoje respondem de verdade: `status`, `workers`, `reload`, `token hash`, e a validação completa de
+`POST /v1/processes` (que ainda falha na hora de enfileirar).
+
+---
+
+## Desenvolvimento
+
+Requer Go 1.27+ e Linux.
+
+```bash
+make install-tools   # golangci-lint e govulncheck
+make build           # bin/processd
+make test-race       # testes com detector de corrida
+make lint            # golangci-lint
+make fmt             # formatação
+```
+
+Layout:
+
+```
+cmd/processd/        entrypoint
+internal/cli/        árvore de comandos cobra, cliente da própria API
+internal/daemon/     montagem do grafo de dependências e ciclo de vida
+internal/api/        handlers HTTP, auth, contrato de erro
+internal/core/       domínio e máquina de estados, sem I/O
+internal/config/     config do daemon e definição de workers
+internal/queue/      admissão, slots, backoff
+internal/supervisor/ supervisão de cada execução
+internal/runner/     exec, process groups, sinais, /proc
+internal/logstore/   arquivos de log por tentativa
+internal/store/      interface de persistência + SQLite
+```
+
+Exemplos de configuração e unit systemd em [`examples/`](examples/).
 
 ---
 

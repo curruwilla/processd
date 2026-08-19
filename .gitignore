@@ -1,2 +1,22 @@
-.idea
+# Binaries
+/bin/
+/dist/
+/processd
+
+# Test and coverage output
+*.out
+*.test
+coverage.*
+
+# Local runtime data
+/var/
+*.db
+*.db-wal
+*.db-shm
+
+# Editors
+/.idea/
+/.vscode/
+*.swp
+
 docs

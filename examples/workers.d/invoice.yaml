@@ -1,0 +1,58 @@
+# Example worker. Arguments reach the process only through declared params,
+# validated by pattern or enum before anything is executed (docs/SPEC.md §5.3).
+version: 1
+workers:
+  - name: invoice-process
+    enabled: true
+    type: task
+
+    command: /usr/bin/php
+    args:
+      - /var/www/app/artisan
+      - invoice:process
+      - "--id={{id}}"
+      - "--verbose={{verbose}}"
+
+    params:
+      id:
+        required: true
+        pattern: "^[0-9]{1,12}$"
+      verbose:
+        required: false
+        enum: ["0", "1"]
+        default: "0"
+
+    cwd: /var/www/app
+    user: www-data
+    group: www-data
+
+    env:
+      APP_ENV: production
+    env_passthrough: [PATH, LANG, TZ]
+
+    timeout: 30m
+    kill_grace: 15s
+
+    max_processes: 20
+
+    lock: "invoice:{{id}}"
+    lock_conflict: queue
+
+    retry:
+      enabled: true
+      max_attempts: 5
+      retry_on: [nonzero_exit, signal, start_error]
+      success_exit_codes: [0]
+      no_retry_exit_codes: [64, 65, 78]
+      reset_after: 10m
+      on_shutdown: false
+      backoff:
+        type: exponential
+        initial: 5s
+        max: 5m
+        multiplier: 2
+        jitter: 0.2
+
+    logs:
+      max_bytes_per_stream: 32MiB
+      retention: 14d

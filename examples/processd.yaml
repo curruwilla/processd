@@ -1,0 +1,40 @@
+# Example daemon configuration. See docs/SPEC.md §20 for every key.
+listen: 127.0.0.1:7373
+data_dir: /var/lib/processd
+log_dir: /var/log/processd
+workers_dir: /etc/processd/workers.d
+
+max_processes: 50
+shutdown_grace: 30s
+
+# kill: terminate a process that outlived the daemon before retrying it.
+# leave: keep it running and do not retry, for manual inspection.
+orphan_policy: kill
+
+# workers: only pre-configured workers may run. Switch to "raw" only if clients
+# must choose the command, and then allowlist every binary explicitly: a free
+# command is remote code execution by design.
+execution_mode: workers
+allowed_commands: []
+
+# Processes never run as root unless this is turned on deliberately.
+allow_root_processes: false
+
+queue:
+  max_depth: 1000
+  item_ttl: 1h
+
+history:
+  retention: 30d
+  max_rows: 500000
+
+logs:
+  max_bytes_per_stream: 32MiB
+  retention: 14d
+
+auth:
+  tokens:
+    # Generate with: printf '%s' "$TOKEN" | processd token hash
+    - name: billing-cron
+      hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      workers: ["invoice-process"]
