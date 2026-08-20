@@ -54,7 +54,17 @@ type Config struct {
 	Queue   Queue   `yaml:"queue"`
 	History History `yaml:"history"`
 	Logs    Logs    `yaml:"logs"`
+	UI      UI      `yaml:"ui"`
 	Auth    Auth    `yaml:"auth"`
+}
+
+// UI configures the built-in web console.
+//
+// The console is static: it holds no credential of its own and reaches the
+// daemon only through the authenticated API, with a token the operator pastes
+// into the page. Turning it off removes the routes entirely.
+type UI struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // Queue bounds the admission queue. An unbounded queue is a memory leak.
@@ -126,6 +136,7 @@ func Default() Config {
 			MaxBytesPerStream: 32 << 20,
 			Retention:         Duration(14 * 24 * time.Hour),
 		},
+		UI:   UI{Enabled: true},
 		Auth: Auth{Tokens: []Token{}},
 	}
 }

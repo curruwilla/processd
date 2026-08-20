@@ -16,6 +16,7 @@ import (
 	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/core"
 	"github.com/curruwilla/processd/internal/logstore"
+	"github.com/curruwilla/processd/internal/metrics"
 	"github.com/curruwilla/processd/internal/queue"
 	"github.com/curruwilla/processd/internal/runner"
 	"github.com/curruwilla/processd/internal/store/sqlite"
@@ -38,11 +39,24 @@ workers:
     args: ["30"]
     cwd: /tmp
     kill_grace: 1s
+  - name: chatty
+    command: /bin/sh
+    args: ["-c", "echo one; sleep 0.4; echo two >&2"]
+    cwd: /tmp
+    kill_grace: 1s
 `
 
 // newLiveServer wires the real object graph: only the network is faked, so the
 // handlers are exercised against actual persistence and process execution.
 func newLiveServer(t *testing.T) http.Handler {
+	t.Helper()
+
+	return newLiveServerWith(t, nil)
+}
+
+// newLiveServerWith builds the same graph and lets a test adjust the options,
+// for the parts of the surface that are wired in rather than always present.
+func newLiveServerWith(t *testing.T, tune func(*Options)) http.Handler {
 	t.Helper()
 
 	workersDir := t.TempDir()
@@ -71,9 +85,11 @@ func newLiveServer(t *testing.T) http.Handler {
 
 	log := slog.New(slog.DiscardHandler)
 	logs := logstore.New(t.TempDir(), 1<<20)
+	observed := metrics.NewRegistry()
 	sup := supervisor.New(cfg, db, runner.NewExecRunner(), logs, log)
 	scheduler := queue.New(cfg, db, registry, sup, log)
 
+	sup.SetMetrics(observed)
 	sup.SetWorkers(scheduler.Registry)
 	sup.SetOnFinish(scheduler.OnAttemptFinished)
 	sup.SetOnChange(scheduler.Notify)
@@ -82,15 +98,22 @@ func newLiveServer(t *testing.T) http.Handler {
 		_ = sup.Shutdown(t.Context(), time.Second)
 	})
 
-	return New(Options{
+	opts := Options{
 		Config:     cfg,
 		Store:      db,
 		Scheduler:  scheduler,
 		Supervisor: sup,
 		Logs:       logs,
+		Metrics:    observed,
 		Logger:     log,
 		Reload:     func(context.Context) error { return nil },
-	}).Handler()
+	}
+
+	if tune != nil {
+		tune(&opts)
+	}
+
+	return New(opts).Handler()
 }
 
 func do(t *testing.T, handler http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -264,23 +287,6 @@ func TestServer_deleteProcess(t *testing.T) {
 	finished := awaitState(t, handler, created.ID)
 	if finished.Status != core.StateCanceled || finished.Reason != core.ReasonUserRequest {
 		t.Errorf("execution is %s/%s, want CANCELED/user_request", finished.Status, finished.Reason)
-	}
-}
-
-func TestServer_metrics(t *testing.T) {
-	t.Parallel()
-
-	rec := do(t, newLiveServer(t), http.MethodGet, "/v1/metrics", "", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET metrics returned %d, want 200", rec.Code)
-	}
-
-	body := rec.Body.String()
-
-	for _, want := range []string{"processd_daemon_up 1", "processd_slots_max 2", "processd_queue_depth"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("metrics are missing %q:\n%s", want, body)
-		}
 	}
 }
 

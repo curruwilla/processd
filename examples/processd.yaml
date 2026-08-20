@@ -32,6 +32,11 @@ logs:
   max_bytes_per_stream: 32MiB
   retention: 14d
 
+# The web console at /ui/. Static assets only: the page asks for a token and
+# calls the same authenticated API as any other client.
+ui:
+  enabled: true
+
 auth:
   tokens:
     # Generate with: printf '%s' "$TOKEN" | processd token hash

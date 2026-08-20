@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,11 +18,13 @@ import (
 	"github.com/curruwilla/processd/internal/api"
 	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/logstore"
+	"github.com/curruwilla/processd/internal/metrics"
 	"github.com/curruwilla/processd/internal/queue"
 	"github.com/curruwilla/processd/internal/runner"
 	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/store/sqlite"
 	"github.com/curruwilla/processd/internal/supervisor"
+	"github.com/curruwilla/processd/internal/webui"
 )
 
 // databaseFile is the SQLite file created inside the configured data dir.
@@ -61,8 +64,13 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	}
 
 	logs := logstore.New(cfg.LogDir, cfg.Logs.MaxBytesPerStream.Bytes())
+	observed := metrics.NewRegistry()
 	sup := supervisor.New(cfg, db, runner.NewExecRunner(), logs, log)
 	scheduler := queue.New(cfg, db, registry, sup, log)
+
+	// Only the supervisor follows an attempt from start to outcome, so the
+	// counters behind /v1/metrics are fed from there.
+	sup.SetMetrics(observed)
 
 	// The supervisor reads worker policy at attempt time and hands executions
 	// back to the scheduler when an attempt ends.
@@ -79,14 +87,21 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 		scheduler:  scheduler,
 	}
 
+	console, err := buildConsole(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	d.api = api.New(api.Options{
 		Config:     cfg,
 		Store:      db,
 		Scheduler:  scheduler,
 		Supervisor: sup,
 		Logs:       logs,
+		Metrics:    observed,
 		Logger:     log,
 		Reload:     d.Reload,
+		UI:         console,
 	})
 
 	if err := os.MkdirAll(cfg.LogDir, 0o750); err != nil {
@@ -96,6 +111,16 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	log.Info("workers loaded", slog.Int("count", registry.Len()))
 
 	return d, nil
+}
+
+// buildConsole returns the console handler, or nil when the operator turned the
+// web UI off.
+func buildConsole(cfg config.Config) (http.Handler, error) {
+	if !cfg.UI.Enabled {
+		return nil, nil
+	}
+
+	return webui.Handler()
 }
 
 // Reload re-reads workers.d. A failed reload leaves the running set untouched.

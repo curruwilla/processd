@@ -47,12 +47,21 @@ type processResponse struct {
 	ExitCode     *int              `json:"exit_code"`
 	Signal       string            `json:"signal,omitempty"`
 	LogTruncated bool              `json:"log_truncated"`
+	Usage        *usageResponse    `json:"usage,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	QueuedAt     *time.Time        `json:"queued_at,omitempty"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"`
 	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
 	DurationMS   *int64            `json:"duration_ms"`
+}
+
+// usageResponse is what a running execution consumes right now, sampled from
+// /proc. A finished execution carries none: there is nothing left to read.
+type usageResponse struct {
+	CPUSeconds float64 `json:"cpu_seconds"`
+	RSSBytes   int64   `json:"rss_bytes"`
+	Threads    int     `json:"threads"`
 }
 
 // listResponse is one cursor-paginated page of executions.
@@ -87,17 +96,40 @@ type workerResponse struct {
 	MaxProcesses int               `json:"max_processes"`
 }
 
-// healthResponse is the body of GET /v1/health.
+// healthResponse is the body of GET /v1/health. Store is only filled in by a
+// deep check, which is the only one that touches the database.
 type healthResponse struct {
 	Status  string `json:"status"`
 	Version string `json:"version"`
+	Store   string `json:"store,omitempty"`
 }
 
 // statsResponse is the body of GET /v1/stats.
+//
+// States counts the non-terminal executions only: a dashboard polls this, and
+// counting the whole retained history on every poll would make the endpoint
+// slower the longer the node has been running.
 type statsResponse struct {
-	SlotsUsed int `json:"slots_used"`
-	SlotsMax  int `json:"slots_max"`
-	Workers   int `json:"workers"`
+	SlotsUsed  int            `json:"slots_used"`
+	SlotsMax   int            `json:"slots_max"`
+	Workers    int            `json:"workers"`
+	Running    int            `json:"running"`
+	QueueDepth int            `json:"queue_depth"`
+	States     map[string]int `json:"states"`
+}
+
+// logLine is one streamed output line, the payload of an SSE "line" event.
+type logLine struct {
+	Stream string `json:"stream"`
+	Text   string `json:"text"`
+}
+
+// logStreamEnd is the payload of the SSE "end" event, sent once the attempt
+// being followed can produce no further output.
+type logStreamEnd struct {
+	Attempt   int    `json:"attempt"`
+	Status    string `json:"status"`
+	Truncated bool   `json:"truncated"`
 }
 
 // newProcessResponse converts a domain execution into its API shape.

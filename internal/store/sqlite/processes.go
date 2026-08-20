@@ -296,12 +296,67 @@ func (s *Store) PendingCount(ctx context.Context) (int, error) {
 	return count, nil
 }
 
+// CountActiveByState counts the executions that are not in a terminal state.
+//
+// The predicate keeps SQLite on the state index instead of the table, so a
+// dashboard polling this endpoint never pays for the retained history.
+func (s *Store) CountActiveByState(ctx context.Context) (map[core.State]int, error) {
+	query := `SELECT state, COUNT(*) FROM processes
+		WHERE state NOT IN ` + terminalStates + ` GROUP BY state`
+
+	return s.countStates(ctx, query)
+}
+
+// CountPendingByWorker counts the executions waiting for a slot, per worker.
+//
+// It shares the predicate of PendingCount, and therefore its index search: the
+// metrics endpoint must not become the one place that scans the history.
+func (s *Store) CountPendingByWorker(ctx context.Context) (map[string]int, error) {
+	const query = `SELECT worker, COUNT(*) FROM processes
+		WHERE state IN ('QUEUED', 'RETRYING') GROUP BY worker`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("counting pending executions per worker: %w", err)
+	}
+
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	counts := map[string]int{}
+
+	for rows.Next() {
+		var (
+			worker string
+			count  int
+		)
+
+		if err := rows.Scan(&worker, &count); err != nil {
+			return nil, fmt.Errorf("counting pending executions per worker: %w", err)
+		}
+
+		counts[worker] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("counting pending executions per worker: %w", err)
+	}
+
+	return counts, nil
+}
+
 // CountByState reports how many executions sit in each state.
 //
 // This one does scan the table. It is only used by the metrics endpoint, which
 // is scraped on an interval, never per request.
 func (s *Store) CountByState(ctx context.Context) (map[core.State]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM processes GROUP BY state`)
+	return s.countStates(ctx, `SELECT state, COUNT(*) FROM processes GROUP BY state`)
+}
+
+// countStates runs a "state, count" query and collects it into a map.
+func (s *Store) countStates(ctx context.Context, query string) (map[core.State]int, error) {
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("counting processes: %w", err)
 	}

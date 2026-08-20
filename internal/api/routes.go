@@ -3,11 +3,17 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
 // publicPaths never require authentication.
 var publicPaths = map[string]bool{"/v1/health": true}
+
+// uiPrefix is where the built-in console is mounted. Its assets are static and
+// carry no execution data: the page asks the operator for a token and then
+// calls the same authenticated API as every other client.
+const uiPrefix = "/ui/"
 
 // Handler builds the routing tree with its middleware chain.
 func (s *Server) Handler() http.Handler {
@@ -19,6 +25,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/processes/{id}", s.deleteProcess)
 	mux.HandleFunc("POST /v1/processes/{id}/signal", s.signalProcess)
 	mux.HandleFunc("GET /v1/processes/{id}/logs", s.processLogs)
+	mux.HandleFunc("GET /v1/processes/{id}/logs/stream", s.streamProcessLogs)
 
 	mux.HandleFunc("GET /v1/workers", s.listWorkers)
 	mux.HandleFunc("POST /v1/reload", s.reloadWorkers)
@@ -27,14 +34,46 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/metrics", s.metrics)
 
+	s.mountUI(mux)
+
 	return s.recoverPanics(s.logRequests(s.authenticate(mux)))
+}
+
+// mountUI serves the console and sends the bare root to it, so that opening the
+// listen address in a browser lands somewhere useful.
+func (s *Server) mountUI(mux *http.ServeMux) {
+	if s.ui == nil {
+		return
+	}
+
+	mux.Handle("GET "+uiPrefix, http.StripPrefix(strings.TrimSuffix(uiPrefix, "/"), s.ui))
+
+	redirect := func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, uiPrefix, http.StatusFound)
+	}
+
+	mux.HandleFunc("GET /ui", redirect)
+	mux.HandleFunc("GET /{$}", redirect)
+}
+
+// isPublic reports whether a path is served without a token.
+func (s *Server) isPublic(path string) bool {
+	if publicPaths[path] {
+		return true
+	}
+
+	if s.ui == nil {
+		return false
+	}
+
+	return path == "/" || path == "/ui" || strings.HasPrefix(path, uiPrefix)
 }
 
 // authenticate rejects every request without a valid bearer token, except on
 // the public liveness endpoint.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if publicPaths[r.URL.Path] {
+		if s.isPublic(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -108,3 +147,9 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
 }
+
+// Unwrap exposes the writer underneath to http.ResponseController. Without it,
+// the access log would cost every streaming handler its ability to flush and to
+// clear the write deadline, and a log stream would arrive all at once, at the
+// end, if at all.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }

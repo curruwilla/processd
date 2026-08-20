@@ -31,3 +31,12 @@ func mustInt(cmd *cobra.Command, name string) int {
 
 	return value
 }
+
+func mustBool(cmd *cobra.Command, name string) bool {
+	value, err := cmd.Flags().GetBool(name)
+	if err != nil {
+		panic(err)
+	}
+
+	return value
+}

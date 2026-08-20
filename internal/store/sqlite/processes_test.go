@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -435,5 +436,79 @@ func TestStore_PendingCount(t *testing.T) {
 	// Queued plus retrying, and nothing else: history must not affect admission.
 	if count != 3 {
 		t.Errorf("PendingCount() = %d, want 3", count)
+	}
+}
+
+func TestStore_CountActiveByState(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	states := []core.State{
+		core.StateQueued, core.StateQueued, core.StateRunning,
+		core.StateCompleted, core.StateFailed, core.StateCanceled,
+	}
+
+	for i, state := range states {
+		if err := db.CreateProcess(ctx, newProcess(fmt.Sprintf("proc_%d", i), state)); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+	}
+
+	active, err := db.CountActiveByState(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveByState() returned %v, want nil", err)
+	}
+
+	if len(active) != 2 || active[core.StateQueued] != 2 || active[core.StateRunning] != 1 {
+		t.Errorf("CountActiveByState() = %v, want only the non-terminal states", active)
+	}
+
+	all, err := db.CountByState(ctx)
+	if err != nil {
+		t.Fatalf("CountByState() returned %v, want nil", err)
+	}
+
+	if len(all) != 5 {
+		t.Errorf("CountByState() = %v, want every state including the terminal ones", all)
+	}
+}
+
+func TestStore_CountPendingByWorker(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	queued := newProcess("proc_1", core.StateQueued)
+	retrying := newProcess("proc_2", core.StateRetrying)
+	running := newProcess("proc_3", core.StateRunning)
+	other := newProcess("proc_4", core.StateQueued)
+	other.Worker = "report"
+
+	for _, p := range []*core.Process{queued, retrying, running, other} {
+		if err := db.CreateProcess(ctx, p); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+	}
+
+	counts, err := db.CountPendingByWorker(ctx)
+	if err != nil {
+		t.Fatalf("CountPendingByWorker() returned %v, want nil", err)
+	}
+
+	if counts["invoice"] != 2 || counts["report"] != 1 || len(counts) != 2 {
+		t.Errorf("CountPendingByWorker() = %v, want 2 pending for invoice and 1 for report", counts)
+	}
+}
+
+func TestStore_Ping(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+
+	if err := db.Ping(t.Context()); err != nil {
+		t.Errorf("Ping() returned %v, want nil", err)
 	}
 }

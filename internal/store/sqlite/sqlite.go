@@ -133,6 +133,21 @@ func (s *Store) applyMigration(ctx context.Context, name string) error {
 	return nil
 }
 
+// Ping verifies that the database still answers a trivial query.
+//
+// A closed or corrupted file is invisible to the HTTP server, which keeps
+// answering liveness checks happily; the deep health check needs a read that
+// actually reaches the storage layer.
+func (s *Store) Ping(ctx context.Context) error {
+	var one int
+
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+		return fmt.Errorf("pinging database: %w", err)
+	}
+
+	return nil
+}
+
 // Close releases the database handle.
 func (s *Store) Close() error {
 	if err := s.db.Close(); err != nil {

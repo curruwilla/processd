@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/curruwilla/processd/internal/config"
@@ -31,21 +32,66 @@ const (
 	idempotencyHeader = "Idempotency-Key"
 )
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.log, http.StatusOK, healthResponse{
-		Status:  "ok",
-		Version: version.Version,
-	})
+// health answers the liveness probe. With ?deep=1 it also proves the store is
+// usable: an HTTP server that answers while the database is gone is a liveness
+// check that lies (docs/SPEC.md §18).
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	response := healthResponse{Status: "ok", Version: version.Version}
+
+	if !isTruthy(r.URL.Query().Get("deep")) {
+		writeJSON(w, s.log, http.StatusOK, response)
+		return
+	}
+
+	if err := s.store.Ping(r.Context()); err != nil {
+		s.log.Error("deep health check failed", slog.Any("error", err))
+
+		response.Status = "degraded"
+		response.Store = "unavailable"
+
+		writeJSON(w, s.log, http.StatusServiceUnavailable, response)
+
+		return
+	}
+
+	response.Store = "ok"
+
+	writeJSON(w, s.log, http.StatusOK, response)
 }
 
-func (s *Server) stats(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.store.CountActiveByState(r.Context())
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	states := make(map[string]int, len(counts))
+	for state, count := range counts {
+		states[string(state)] = count
+	}
+
 	used, limit := s.scheduler.Slots().Usage()
 
 	writeJSON(w, s.log, http.StatusOK, statsResponse{
-		SlotsUsed: used,
-		SlotsMax:  limit,
-		Workers:   s.scheduler.Registry().Len(),
+		SlotsUsed:  used,
+		SlotsMax:   limit,
+		Workers:    s.scheduler.Registry().Len(),
+		Running:    s.supervisor.Running(),
+		QueueDepth: counts[core.StateQueued] + counts[core.StateRetrying],
+		States:     states,
 	})
+}
+
+// isTruthy reads the boolean query parameters of the API, which accept the
+// usual spellings rather than only "true".
+func isTruthy(raw string) bool {
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) listWorkers(w http.ResponseWriter, r *http.Request) {
@@ -279,7 +325,7 @@ func (s *Server) getProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, s.log, http.StatusOK, newProcessResponse(process))
+	writeJSON(w, s.log, http.StatusOK, s.withUsage(newProcessResponse(process)))
 }
 
 func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request) {
@@ -297,7 +343,7 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]processResponse, 0, len(page.Items))
 	for _, process := range page.Items {
-		items = append(items, newProcessResponse(process))
+		items = append(items, s.withUsage(newProcessResponse(process)))
 	}
 
 	writeJSON(w, s.log, http.StatusOK, listResponse{Items: items, NextCursor: page.NextCursor})
@@ -403,6 +449,24 @@ func (s *Server) processLogs(w http.ResponseWriter, r *http.Request) {
 		Lines:     lines,
 		Truncated: process.LogTruncated,
 	})
+}
+
+// withUsage attaches a live resource sample to an execution that is running
+// here. Anything else is left as it is: /proc holds nothing for a process that
+// already exited, and a stale sample would be worse than none.
+func (s *Server) withUsage(response processResponse) processResponse {
+	usage, ok := s.supervisor.Usage(response.ID)
+	if !ok {
+		return response
+	}
+
+	response.Usage = &usageResponse{
+		CPUSeconds: usage.CPUSeconds,
+		RSSBytes:   usage.RSSBytes,
+		Threads:    usage.Threads,
+	}
+
+	return response
 }
 
 // replayIdempotent returns the execution a repeated Idempotency-Key already

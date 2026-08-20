@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>processd</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9654;</text></svg>">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark">&#9654;</span>
+      <span>processd</span>
+      <span class="version" id="version"></span>
+    </div>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab" data-view="overview" type="button">Overview</button>
+      <button class="tab" data-view="processes" type="button">Processes</button>
+      <button class="tab" data-view="workers" type="button">Workers</button>
+    </nav>
+
+    <form class="auth" id="auth-form" autocomplete="off">
+      <input type="password" id="token" placeholder="API token" aria-label="API token" spellcheck="false">
+      <button type="submit">Save</button>
+      <span class="dot" id="health" title="daemon health"></span>
+    </form>
+  </header>
+
+  <main>
+    <p class="banner" id="banner" hidden></p>
+
+    <section class="view" id="view-overview">
+      <div class="cards">
+        <article class="card">
+          <h2>Daemon</h2>
+          <p class="metric" id="card-status">&mdash;</p>
+          <p class="hint" id="card-store"></p>
+        </article>
+        <article class="card">
+          <h2>Slots</h2>
+          <p class="metric" id="card-slots">&mdash;</p>
+          <div class="bar"><span id="card-slots-bar"></span></div>
+        </article>
+        <article class="card">
+          <h2>Running</h2>
+          <p class="metric" id="card-running">&mdash;</p>
+          <p class="hint">attempts under supervision</p>
+        </article>
+        <article class="card">
+          <h2>Queue</h2>
+          <p class="metric" id="card-queue">&mdash;</p>
+          <p class="hint">waiting for a slot</p>
+        </article>
+        <article class="card">
+          <h2>Workers</h2>
+          <p class="metric" id="card-workers">&mdash;</p>
+          <p class="hint">definitions loaded</p>
+        </article>
+      </div>
+
+      <h2 class="section">Active states</h2>
+      <div class="chips" id="state-chips"><span class="hint">nothing active</span></div>
+
+      <h2 class="section">Latest executions</h2>
+      <div class="table-wrap">
+        <table id="recent">
+          <thead>
+            <tr><th>ID</th><th>Worker</th><th>State</th><th>Attempt</th><th>Duration</th><th>Created</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="view" id="view-processes" hidden>
+      <form class="filters" id="filters">
+        <label>State
+          <select id="filter-state">
+            <option value="">any</option>
+          </select>
+        </label>
+        <label>Worker
+          <input type="text" id="filter-worker" placeholder="all workers" spellcheck="false">
+        </label>
+        <button type="submit">Apply</button>
+        <label class="toggle">
+          <input type="checkbox" id="auto-refresh" checked> auto refresh
+        </label>
+      </form>
+
+      <div class="table-wrap">
+        <table id="processes">
+          <thead>
+            <tr><th>ID</th><th>Worker</th><th>State</th><th>Attempt</th><th>PID</th><th>Duration</th><th>Created</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <button id="load-more" class="ghost" type="button" hidden>Load more</button>
+    </section>
+
+    <section class="view" id="view-workers" hidden>
+      <div class="table-wrap">
+        <table id="workers">
+          <thead>
+            <tr><th>Name</th><th>Type</th><th>Enabled</th><th>Command</th><th>Max</th><th>Params</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-head">
+      <div>
+        <h2 id="drawer-title">execution</h2>
+        <p class="hint" id="drawer-sub"></p>
+      </div>
+      <button class="ghost" id="drawer-close" type="button">Close</button>
+    </div>
+
+    <div class="drawer-body">
+      <dl class="fields" id="drawer-fields"></dl>
+
+      <div class="actions">
+        <label>Grace
+          <input type="text" id="stop-grace" value="15s" size="5" spellcheck="false">
+        </label>
+        <button id="action-stop" type="button">Stop</button>
+        <select id="signal-name">
+          <option>SIGTERM</option><option>SIGINT</option><option>SIGHUP</option>
+          <option>SIGQUIT</option><option>SIGUSR1</option><option>SIGUSR2</option>
+        </select>
+        <button id="action-signal" class="ghost" type="button">Send signal</button>
+      </div>
+
+      <div class="log-head">
+        <label>Stream
+          <select id="log-stream">
+            <option value="both">both</option>
+            <option value="stdout">stdout</option>
+            <option value="stderr">stderr</option>
+          </select>
+        </label>
+        <label>Attempt
+          <select id="log-attempt"></select>
+        </label>
+        <label class="toggle"><input type="checkbox" id="log-follow" checked> follow</label>
+        <span class="hint" id="log-status"></span>
+      </div>
+
+      <pre class="logs" id="logs"></pre>
+    </div>
+  </aside>
+
+  <div class="modal" id="run-modal" hidden>
+    <form class="modal-card" id="run-form">
+      <h2 id="run-title">Run worker</h2>
+      <div id="run-params"></div>
+      <p class="hint" id="run-error"></p>
+      <div class="modal-actions">
+        <button type="button" class="ghost" id="run-cancel">Cancel</button>
+        <button type="submit">Run</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

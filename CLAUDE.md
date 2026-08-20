@@ -39,7 +39,9 @@ internal/config/     daemon config and worker definitions, strict YAML decoding
 internal/queue/      admission, slots, backoff
 internal/supervisor/ per-execution supervision
 internal/runner/     exec, process groups, signals, /proc fingerprinting (Linux only)
-internal/logstore/   per-attempt capped log files
+internal/logstore/   per-attempt capped log files, tail and follow
+internal/metrics/    Prometheus text-format counters and histograms
+internal/webui/      embedded web console (go:embed)
 internal/store/      persistence interface + SQLite implementation
 ```
 

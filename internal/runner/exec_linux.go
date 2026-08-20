@@ -137,6 +137,12 @@ func (r *ExecRunner) Signal(h *Handle, name string) error {
 	return h.signalGroup(sig)
 }
 
+// Usage samples the process through /proc, refusing to answer for a PID that
+// is no longer the fingerprinted process.
+func (r *ExecRunner) Usage(h *Handle) (Usage, error) {
+	return ProcessUsage(h.PID, h.PIDStartTime)
+}
+
 // Stop asks the process group to terminate and escalates to SIGKILL once grace
 // has elapsed.
 func (r *ExecRunner) Stop(ctx context.Context, h *Handle, grace time.Duration) error {

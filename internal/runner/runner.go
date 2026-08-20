@@ -61,6 +61,16 @@ func (h *Handle) markDone() {
 	h.doneOnce.Do(func() { close(h.done) })
 }
 
+// Usage is a point-in-time resource sample of a running process, read from
+// /proc. It is only meaningful while the process is alive.
+type Usage struct {
+	// CPUSeconds is the CPU time the process has consumed, user plus system.
+	CPUSeconds float64
+	// RSSBytes is the resident set size: the memory actually held in RAM.
+	RSSBytes int64
+	Threads  int
+}
+
 // Result is how one attempt ended.
 type Result struct {
 	ExitCode int
@@ -79,4 +89,8 @@ type Runner interface {
 	// Stop asks the process group to terminate, escalating to SIGKILL after
 	// grace has elapsed.
 	Stop(ctx context.Context, h *Handle, grace time.Duration) error
+	// Usage samples the resources the process is using right now. It fails once
+	// the process is gone, which is not an error worth reporting: a sample of a
+	// dead process has no meaning.
+	Usage(h *Handle) (Usage, error)
 }

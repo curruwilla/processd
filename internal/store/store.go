@@ -73,6 +73,21 @@ type Store interface {
 	// request that runs per submission.
 	CountByState(ctx context.Context) (map[core.State]int, error)
 
+	// CountActiveByState reports how many executions sit in each non-terminal
+	// state. Restricted to those states, it answers from the state index, so it
+	// can back an endpoint a dashboard polls; CountByState cannot.
+	CountActiveByState(ctx context.Context) (map[core.State]int, error)
+
+	// CountPendingByWorker reports how many executions each worker has waiting
+	// for a slot. Like PendingCount, it is restricted to the two pending states
+	// so the answer stays an index search instead of a full scan.
+	CountPendingByWorker(ctx context.Context) (map[string]int, error)
+
+	// Ping verifies that the database still answers. It backs the deep health
+	// check, which must fail when the store is unusable even though the HTTP
+	// server itself is fine.
+	Ping(ctx context.Context) error
+
 	// AcquireLock claims key for the execution, or returns core.ErrLockHeld.
 	// Re-acquiring a lock the same execution already holds succeeds, so a retry
 	// never loses its own lock.

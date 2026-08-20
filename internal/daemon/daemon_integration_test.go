@@ -414,3 +414,115 @@ func TestDaemon_recoversAfterRestart(t *testing.T) {
 		t.Errorf("pid %d is still alive after shutdown", *running.PID)
 	}
 }
+
+func TestDaemon_streamsAttemptLogs(t *testing.T) {
+	t.Parallel()
+
+	daemon := start(t, newConfig(t))
+	defer daemon.shutdown()
+
+	created := daemon.submit(`{"worker":"hello","params":{"id":"77"}}`)
+	daemon.awaitTerminal(created.ID)
+
+	resp := daemon.request(http.MethodGet, "/v1/processes/"+created.ID+"/logs/stream?tail=0", "")
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream returned %d, want 200", resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the stream: %v", err)
+	}
+
+	body := string(raw)
+
+	if !strings.Contains(body, `"text":"hello 77"`) {
+		t.Errorf("stream carried no output line:\n%s", body)
+	}
+
+	if !strings.Contains(body, "event: end") || !strings.Contains(body, `"status":"COMPLETED"`) {
+		t.Errorf("stream did not report how the attempt ended:\n%s", body)
+	}
+}
+
+// TestDaemon_streamEndsWithTheAttempt follows an execution that is still
+// running, over a real connection: nothing is buffered until the end, and the
+// stream closes on its own once the attempt is stopped.
+func TestDaemon_streamEndsWithTheAttempt(t *testing.T) {
+	t.Parallel()
+
+	daemon := start(t, newConfig(t))
+	defer daemon.shutdown()
+
+	created := daemon.submit(`{"worker":"sleeper"}`)
+
+	resp := daemon.request(http.MethodGet, "/v1/processes/"+created.ID+"/logs/stream", "")
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream returned %d, want 200", resp.StatusCode)
+	}
+
+	stopped := daemon.request(http.MethodDelete, "/v1/processes/"+created.ID+"?grace=0s", "")
+	_ = stopped.Body.Close()
+
+	done := make(chan string, 1)
+
+	go func() {
+		raw, _ := io.ReadAll(resp.Body)
+		done <- string(raw)
+	}()
+
+	select {
+	case body := <-done:
+		if !strings.Contains(body, "event: end") {
+			t.Errorf("stream closed without an end event:\n%s", body)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("stream did not end with the attempt")
+	}
+}
+
+func TestDaemon_servesTheConsole(t *testing.T) {
+	t.Parallel()
+
+	daemon := start(t, newConfig(t))
+	defer daemon.shutdown()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, daemon.baseURL+"/ui/", nil)
+	if err != nil {
+		t.Fatalf("building console request: %v", err)
+	}
+
+	// No Authorization header: the console itself is public, the API it calls
+	// is not.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("calling the console: %v", err)
+	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /ui/ returned %d, want 200", resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the console: %v", err)
+	}
+
+	if !strings.Contains(string(raw), "<title>processd</title>") {
+		t.Errorf("GET /ui/ did not serve the console page")
+	}
+}

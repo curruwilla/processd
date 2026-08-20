@@ -47,13 +47,28 @@ func (e *execution) setIntent(reason core.Reason) bool {
 	return true
 }
 
+// Metrics records what each attempt did. Only the supervisor follows an
+// attempt from its start to its outcome, so the counters are fed from here.
+type Metrics interface {
+	AttemptStarted(worker string)
+	AttemptFinished(worker, state string, elapsed time.Duration)
+}
+
+// nopMetrics is the default observer: the supervisor runs the same with or
+// without one attached.
+type nopMetrics struct{}
+
+func (nopMetrics) AttemptStarted(string)                         {}
+func (nopMetrics) AttemptFinished(string, string, time.Duration) {}
+
 // Supervisor owns the lifecycle of running executions.
 type Supervisor struct {
-	cfg    config.Config
-	store  store.Store
-	runner runner.Runner
-	logs   *logstore.Store
-	log    *slog.Logger
+	cfg     config.Config
+	store   store.Store
+	runner  runner.Runner
+	logs    *logstore.Store
+	metrics Metrics
+	log     *slog.Logger
 
 	mu       sync.Mutex
 	running  map[string]*execution
@@ -86,6 +101,7 @@ func New(
 		store:    st,
 		runner:   run,
 		logs:     logs,
+		metrics:  nopMetrics{},
 		log:      log,
 		running:  map[string]*execution{},
 		workers:  func() *config.Registry { return nil },
@@ -96,6 +112,9 @@ func New(
 
 // SetWorkers injects the worker registry lookup.
 func (s *Supervisor) SetWorkers(workers func() *config.Registry) { s.workers = workers }
+
+// SetMetrics injects the observer fed by every attempt.
+func (s *Supervisor) SetMetrics(m Metrics) { s.metrics = m }
 
 // SetOnFinish injects the callback invoked after every attempt ends, whatever
 // the outcome. The scheduler uses it to free the slot and look for new work.
@@ -178,6 +197,8 @@ func (s *Supervisor) Start(ctx context.Context, caller *core.Process) error {
 	s.running[p.ID] = exec
 	s.mu.Unlock()
 
+	s.metrics.AttemptStarted(p.Worker)
+
 	s.log.Info("execution started",
 		slog.String("process", p.ID),
 		slog.String("worker", p.Worker),
@@ -216,6 +237,8 @@ func (s *Supervisor) startFailed(ctx context.Context, p *core.Process, worker *c
 		return err
 	}
 
+	// An attempt that never became a process has an outcome but no duration.
+	s.metrics.AttemptFinished(p.Worker, string(p.State), 0)
 	s.onFinish(p)
 
 	return nil
@@ -296,6 +319,8 @@ func (s *Supervisor) finish(ctx context.Context, exec *execution, result runner.
 	if err != nil {
 		s.log.Error("persisting execution outcome", slog.String("process", p.ID), slog.Any("error", err))
 	}
+
+	s.metrics.AttemptFinished(p.Worker, string(p.State), p.Duration())
 
 	s.log.Info("execution finished",
 		slog.String("process", p.ID),
