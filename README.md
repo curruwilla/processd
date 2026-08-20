@@ -55,61 +55,256 @@ Não substitui o systemd para serviços de sistema.
 
 ---
 
-## Uso
+## Início rápido
 
-Define um worker:
+### 1. Instalar
 
-```yaml
-# /etc/processd/workers.d/invoice.yaml
-version: 1
-workers:
-  - name: invoice-process
-    type: task
-    command: /usr/bin/php
-    args: ["/var/www/app/artisan", "invoice:process", "--id={{id}}"]
-    params:
-      id: { required: true, pattern: "^[0-9]{1,12}$" }
-    cwd: /var/www/app
-    user: www-data
-    max_processes: 20
-    timeout: 30m
-    retry:
-      enabled: true
-      max_attempts: 5
-      backoff: { type: exponential, initial: 5s, max: 5m, jitter: 0.2 }
+```bash
+git clone https://github.com/curruwilla/processd && cd processd
+make build                                  # bin/processd, build sem CGO
+sudo install -m 0755 bin/processd /usr/local/bin/processd
+sudo mkdir -p /etc/processd/workers.d /var/lib/processd /var/log/processd
 ```
 
-Sobe o daemon e dispara uma execução:
+### 2. Gerar o token e a config do daemon
+
+```bash
+TOKEN=$(openssl rand -hex 32)
+printf '%s' "$TOKEN" | processd token hash   # imprime sha256:...
+```
+
+Só o hash vai para o arquivo; o segredo nunca é gravado em disco pelo daemon. O token é lido de
+stdin justamente para não aparecer na lista de processos nem no histórico do shell.
+
+```yaml
+# /etc/processd/processd.yaml
+listen: 127.0.0.1:7373
+data_dir: /var/lib/processd
+log_dir: /var/log/processd
+workers_dir: /etc/processd/workers.d
+
+max_processes: 50
+
+auth:
+  tokens:
+    - name: dev
+      hash: "sha256:<cole o hash aqui>"
+```
+
+### 3. Declarar um worker
+
+```yaml
+# /etc/processd/workers.d/backup.yaml
+version: 1
+workers:
+  - name: backup
+    command: /usr/bin/rsync
+    args: ["-a", "/data/{{bucket}}/", "/backup/{{bucket}}/"]
+    params:
+      bucket: { required: true, pattern: "^[a-z0-9-]{1,32}$" }
+    cwd: /
+    user: backup
+    timeout: 1h
+    max_processes: 2
+    lock: "backup:{{bucket}}"
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff: { type: exponential, initial: 10s, max: 2m, jitter: 0.2 }
+```
+
+Referência completa dos campos em [Definição de workers](#definição-de-workers). A carga é
+tudo-ou-nada: um arquivo inválido derruba o reload inteiro, então um worker nunca desaparece em
+silêncio de um daemon vivo.
+
+### 4. Subir o daemon
 
 ```bash
 processd serve --config /etc/processd/processd.yaml
+```
 
+Como serviço, use [`examples/processd.service`](examples/processd.service):
+
+```bash
+sudo cp examples/processd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now processd
+```
+
+`TimeoutStopSec` do unit precisa ser maior que `shutdown_grace` (+10s de folga), senão o systemd
+mata o daemon no meio do encerramento gracioso.
+
+### 5. Disparar e acompanhar
+
+```bash
+export PROCESSD_SERVER=http://127.0.0.1:7373
+export PROCESSD_TOKEN=$TOKEN
+
+processd run backup --param bucket=faturas    # devolve o id da execução
+processd ps --status RUNNING
+processd logs -f proc_01KABCDEF...            # acompanha a saída ao vivo
+processd stop proc_01KABCDEF... --grace 15s
+```
+
+O mesmo pela API:
+
+```bash
 curl -X POST http://127.0.0.1:7373/v1/processes \
   -H "Authorization: Bearer $PROCESSD_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"worker":"invoice-process","params":{"id":"123"}}'
+  -d '{"worker":"backup","params":{"bucket":"faturas"}}'
 ```
 
 ```json
 { "id": "proc_01KABCDEF...", "status": "RUNNING", "pid": 18231, "attempt": 1 }
 ```
 
-Acompanha:
-
-```bash
-processd status
-processd workers
-processd ps
-processd logs proc_01KABCDEF...
-processd logs -f proc_01KABCDEF...      # acompanha a saída até a tentativa terminar
-processd stop proc_01KABCDEF...
-```
-
-O console web fica em `http://127.0.0.1:7373/ui/` — painel do nó, execuções com filtro, detalhe com
-CPU/memória ao vivo e logs em streaming. A página é estática e servida sem token: pede o token ao
-operador e usa a mesma API pública. Desligue com `ui: { enabled: false }`.
+Console web em `http://127.0.0.1:7373/ui/`: painel do nó, execuções com filtro, detalhe com
+CPU/memória ao vivo, logs em streaming e disparo de workers. A página é estática e servida sem
+token — pede o token ao operador e usa a mesma API pública. Desligue com `ui: { enabled: false }`.
 
 Métricas em `/v1/metrics`, no formato texto do Prometheus.
+
+### Depois de editar um worker
+
+```bash
+processd reload                  # ou: sudo systemctl kill -s HUP processd
+processd workers                 # confere o que o daemon carregou
+```
+
+Execuções em andamento mantêm a definição com que nasceram: o reload nunca muda um processo que já
+está rodando.
+
+---
+
+## CLI
+
+Um único binário, cliente da mesma API pública. Configuração do cliente por `--server`/
+`PROCESSD_SERVER` e `--token`/`PROCESSD_TOKEN`.
+
+| Comando | O que faz |
+|---|---|
+| `processd serve --config <path>` | sobe o daemon |
+| `processd status` | saúde, versão, slots, execuções rodando e na fila |
+| `processd ps [--status S] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lista execuções |
+| `processd run <worker> [--param nome=valor] [--lock k]` | cria uma execução |
+| `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f]` | saída capturada, com `-f` em streaming |
+| `processd stop <id> [--grace 15s]` | SIGTERM no grupo, SIGKILL depois da graça |
+| `processd signal <id> <SINAL>` | envia um sinal do allowlist ao grupo |
+| `processd workers` | workers carregados, com os params declarados |
+| `processd reload` | recarrega `workers.d` |
+| `processd token hash` | lê um token de stdin e imprime o digest da config |
+
+Sinais aceitos: `SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGKILL`,
+`SIGSTOP`, `SIGCONT`. Qualquer outro é recusado com `400`, e todo sinal atinge o **process group**
+inteiro — sinalizar só o PID deixaria netos vivos.
+
+---
+
+## Definição de workers
+
+Arquivos `*.yaml` em `workers_dir` (default `/etc/processd/workers.d`), cada um com `version: 1` e
+uma lista `workers`. O nome é chave global do daemon, não do arquivo. A decodificação é **estrita**:
+chave desconhecida é erro de carga, nunca um default silencioso.
+
+Durações aceitam a sintaxe do Go mais `d` e `w`: `30s`, `5m`, `1h30m`, `30d`, `2w`. Tamanhos aceitam
+sufixo IEC ou SI: `32MiB`, `32MB`, ou bytes puros.
+
+### Campos do worker
+
+| Chave | Tipo | Default | Valores e regras |
+|---|---|---|---|
+| `name` | string | — obrigatório | único entre todos os arquivos |
+| `enabled` | bool | `true` | `false` faz o daemon carregar o worker e recusar execuções com `422` |
+| `type` | enum | `task` | `task` é o único aceito hoje; `service` é reservado para a fase 4 |
+| `command` | string | — obrigatório | caminho **absoluto**, executado direto — nunca por shell |
+| `args` | lista de strings | `[]` | pode conter `{{param}}`; a substituição não divide elementos |
+| `params` | mapa | `{}` | declaração dos valores que o request pode enviar (tabela abaixo) |
+| `cwd` | string | `/` | caminho absoluto; precisa existir e ser diretório |
+| `user` | string | vazio | **nome** de usuário do sistema, não uid. Vazio com daemon como root → start recusado, a menos que `allow_root_processes: true` |
+| `group` | string | grupo primário do `user` | nome de grupo do sistema; grupos suplementares são aplicados |
+| `env` | mapa string→string | `{}` | ambiente do filho. O ambiente do daemon **não** é herdado: ele guarda segredos |
+| `env_passthrough` | lista de strings | `[]` | nomes de variáveis do daemon repassadas explicitamente, ex.: `[PATH, LANG, TZ]` |
+| `timeout` | duração | `0` = sem timeout | ao estourar: `SIGTERM` no grupo → `kill_grace` → `SIGKILL` |
+| `kill_grace` | duração | `15s` | espera entre o `SIGTERM` e o `SIGKILL` |
+| `max_processes` | int ≥ 0 | `0` = só o limite global | teto de simultâneas do worker; o excedente **espera na fila**, não é recusado |
+| `lock` | string | vazio = sem lock | chave de exclusão mútua, pode conter `{{param}}` |
+| `lock_conflict` | enum | `queue` | `queue` espera o lock liberar; `reject` responde `409` na hora |
+| `overridable` | lista enum | `[]` | o que o request pode sobrescrever: `env`, `timeout`, `lock`. Override não listado → `400` |
+| `retry` | objeto | desligado | tabela abaixo |
+| `logs.max_bytes_per_stream` | tamanho | o valor do daemon (`32MiB`) | cap por stream por tentativa; a retenção é do daemon, não do worker |
+
+### `params`
+
+Argumentos chegam ao processo **apenas** por params declarados e validados.
+
+| Chave | Tipo | Default | Regra |
+|---|---|---|---|
+| `required` | bool | `false` | ausente no request → `400` |
+| `pattern` | regex RE2 | vazio | compilada na carga do worker; valor fora do padrão → `400` |
+| `enum` | lista de strings | `[]` | valor fora da lista → `400` |
+| `default` | string | vazio | usado quando o param é opcional e não veio no request |
+
+Substituição (`docs/SPEC.md` §5.3):
+
+1. `{{nome}}` só é resolvido **dentro** de elementos de `args` e em `lock`.
+2. Nunca cria, divide ou junta elementos de argv: um valor com espaços continua sendo um argumento.
+3. Placeholder não declarado em `params` **impede a carga** do worker — um typo não vira `{{id}}`
+   literal na linha de comando.
+4. Param enviado e não declarado → `400`.
+5. Elemento de argv que é só um placeholder opcional ausente é removido, em vez de virar `""`.
+
+### `retry`
+
+Os defaults abaixo só são aplicados quando `enabled: true`.
+
+| Chave | Tipo | Default | Valores |
+|---|---|---|---|
+| `enabled` | bool | `false` | sem isso, uma tentativa e pronto |
+| `max_attempts` | int ≥ 1 | `1` | total, incluindo a primeira tentativa |
+| `retry_on` | lista enum | `[nonzero_exit, signal, start_error]` | `nonzero_exit`, `signal`, `start_error`, `timeout` |
+| `success_exit_codes` | lista de int | `[0]` | código listado → `COMPLETED` |
+| `no_retry_exit_codes` | lista de int | `[]` | código listado → `FAILED` imediato, sem retry |
+| `reset_after` | duração | `0` = desligado | tentativa que durou mais que isso zera o contador |
+| `on_shutdown` | bool | `false` | `true` devolve a execução à fila no shutdown, em vez de cancelá-la |
+| `backoff.type` | enum | `exponential` | `exponential`, `linear`, `fixed` |
+| `backoff.initial` | duração | `5s` | atraso da primeira repetição |
+| `backoff.max` | duração | `5m` | teto do atraso |
+| `backoff.multiplier` | float > 0 | `2` | usado só por `exponential` |
+| `backoff.jitter` | float 0..1 | `0` | espalha o atraso em `±jitter`; sem ele, tudo que falhou junto repete junto |
+
+Curvas: `fixed` = `initial`; `linear` = `initial × tentativa`; `exponential` =
+`initial × multiplier^(tentativa-1)`. O teto `max` é aplicado antes do jitter.
+
+O lock é mantido entre tentativas: soltá-lo durante o backoff deixaria outra execução tomá-lo no meio
+do retry.
+
+### Configuração do daemon
+
+| Chave | Default | Valores e regras |
+|---|---|---|
+| `listen` | `127.0.0.1:7373` | endereço do HTTP; sem TLS nativo, ponha um proxy na frente para expor |
+| `data_dir` | `/var/lib/processd` | SQLite do estado |
+| `log_dir` | `/var/log/processd` | arquivos de saída por tentativa |
+| `workers_dir` | `/etc/processd/workers.d` | onde os `*.yaml` de worker são lidos |
+| `max_processes` | `50` | teto do nó inteiro |
+| `shutdown_grace` | `30s` | orçamento dos processos no encerramento |
+| `orphan_policy` | `kill` | `kill` mata o processo que sobreviveu ao daemon antes do retry; `leave` mantém e não repete |
+| `execution_mode` | `workers` | `workers` só executa workers; `raw` aceita comando do cliente e exige `allowed_commands` — comando livre é RCE por design |
+| `allowed_commands` | `[]` | allowlist de caminhos absolutos, usada só no modo `raw` |
+| `allow_root_processes` | `false` | permite rodar sem `user` quando o daemon é root |
+| `queue.max_depth` | `1000` | fila cheia → `429` |
+| `queue.item_ttl` | `1h` | item que espera mais que isso vira `queue_timeout` |
+| `history.retention` | `30d` | GC do histórico de execuções |
+| `history.max_rows` | `500000` | teto de linhas retidas |
+| `logs.max_bytes_per_stream` | `32MiB` | cap por stream por tentativa; atingido, marca `log_truncated` |
+| `logs.retention` | `14d` | GC dos arquivos de log |
+| `ui.enabled` | `true` | console web em `/ui/` |
+| `auth.tokens[].name` | — | identifica o token na trilha de auditoria |
+| `auth.tokens[].hash` | — | `sha256:...`, gerado por `processd token hash` |
+| `auth.tokens[].workers` | `[]` = todos | restringe o token a workers específicos |
+
+Exemplos completos em [`examples/`](examples/); a especificação de cada campo, com o porquê, em
+[`docs/SPEC.md`](docs/SPEC.md) §5 e §20.
 
 ---
 

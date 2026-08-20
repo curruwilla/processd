@@ -115,9 +115,12 @@ type Backoff struct {
 }
 
 // WorkerLogs overrides the daemon-wide log limits for one worker.
+//
+// Only the size cap is per worker. Retention is not: the log GC walks files by
+// age, and asking it which worker wrote each one would turn a directory walk
+// into one store lookup per file (docs/SPEC.md §10).
 type WorkerLogs struct {
 	MaxBytesPerStream ByteSize `yaml:"max_bytes_per_stream"`
-	Retention         Duration `yaml:"retention"`
 }
 
 // IsEnabled reports whether the worker may be executed. Workers are enabled

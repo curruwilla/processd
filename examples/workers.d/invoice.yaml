@@ -53,6 +53,6 @@ workers:
         multiplier: 2
         jitter: 0.2
 
+    # Only the size cap is per worker: retention belongs to the daemon.
     logs:
       max_bytes_per_stream: 32MiB
-      retention: 14d
