@@ -28,6 +28,10 @@
 
 * { box-sizing: border-box; }
 
+/* Layout rules below set `display`, which would otherwise beat the user agent
+   rule for the `hidden` attribute and leave hidden panels on screen. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);

@@ -63,12 +63,40 @@ Não substitui o systemd para serviços de sistema.
 git clone https://github.com/curruwilla/processd && cd processd
 make build                                  # bin/processd, build sem CGO
 sudo install -m 0755 bin/processd /usr/local/bin/processd
-sudo mkdir -p /etc/processd/workers.d /var/lib/processd /var/log/processd
 ```
 
-### 2. Gerar o token e a config do daemon
+### 2. Preparar o node
 
 ```bash
+sudo processd setup
+```
+
+Um comando entrega o node inteiro: cria `/etc/processd/workers.d`, `/var/lib/processd` e
+`/var/log/processd`, escreve `/etc/processd/processd.yaml`, gera um token de API, instala
+`/etc/systemd/system/processd.service` e sobe o serviço. No fim imprime o token e todos os
+caminhos e endereços do node — config, logs, dados, unit, API, console web, métricas — junto dos
+comandos para conferir cada um deles.
+
+O daemon guarda só o digest do token, então o segredo em texto puro fica em `/etc/processd/token`
+(modo `0600`, dono root). Esse arquivo é o que evita o `unauthorized` clássico depois do setup:
+
+* os comandos cliente (`processd ps`, `run`, `logs`, ...) leem o arquivo quando `--token` e
+  `PROCESSD_TOKEN` não estão definidos — como root, não é preciso colar token nenhum;
+* rodar `processd setup` de novo reaproveita o token já instalado, em vez de invalidar quem já
+  está configurado. Para trocar de propósito: `sudo processd setup --rotate-token`.
+
+Outras flags: `--dry-run` mostra o que faria sem tocar em nada, `--listen` muda o bind,
+`--systemd=false` pula o unit, `--start=false` instala e habilita sem iniciar, `--output json`
+devolve o mesmo relatório para script.
+
+A config é reescrita a partir dos valores que o daemon leu — o que descarta comentários e reordena
+chaves — e o arquivo anterior fica salvo ao lado como `processd.yaml.bak-<timestamp>`.
+
+<details>
+<summary>Setup manual, sem <code>processd setup</code></summary>
+
+```bash
+sudo mkdir -p /etc/processd/workers.d /var/lib/processd /var/log/processd
 TOKEN=$(openssl rand -hex 32)
 printf '%s' "$TOKEN" | processd token hash   # imprime sha256:...
 ```
@@ -90,6 +118,8 @@ auth:
     - name: dev
       hash: "sha256:<cole o hash aqui>"
 ```
+
+</details>
 
 ### 3. Declarar um worker
 
@@ -119,25 +149,31 @@ silêncio de um daemon vivo.
 
 ### 4. Subir o daemon
 
+`processd setup` já deixou o serviço rodando; para conferir:
+
+```bash
+systemctl status processd
+journalctl -u processd -f
+```
+
+Em primeiro plano, sem systemd:
+
 ```bash
 processd serve --config /etc/processd/processd.yaml
 ```
 
-Como serviço, use [`examples/processd.service`](examples/processd.service):
-
-```bash
-sudo cp examples/processd.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now processd
-```
-
-`TimeoutStopSec` do unit precisa ser maior que `shutdown_grace` (+10s de folga), senão o systemd
-mata o daemon no meio do encerramento gracioso.
+O unit gerado sai de [`examples/processd.service`](examples/processd.service), com
+`TimeoutStopSec` calculado a partir de `shutdown_grace` (+15s de folga): se o timeout do systemd
+vencer antes, o daemon morre no meio do encerramento gracioso.
 
 ### 5. Disparar e acompanhar
 
+Como root no próprio node, o token sai de `/etc/processd/token` sozinho. De outra máquina, ou
+como outro usuário, aponte o cliente:
+
 ```bash
 export PROCESSD_SERVER=http://127.0.0.1:7373
-export PROCESSD_TOKEN=$TOKEN
+export PROCESSD_TOKEN=$(sudo cat /etc/processd/token)
 
 processd run backup --param bucket=faturas    # devolve o id da execução
 processd ps --status RUNNING
@@ -179,10 +215,12 @@ está rodando.
 ## CLI
 
 Um único binário, cliente da mesma API pública. Configuração do cliente por `--server`/
-`PROCESSD_SERVER` e `--token`/`PROCESSD_TOKEN`.
+`PROCESSD_SERVER` e `--token`/`PROCESSD_TOKEN`; sem token explícito, o cliente lê o arquivo
+gravado por `processd setup` ao lado da config (`/etc/processd/token`).
 
 | Comando | O que faz |
 |---|---|
+| `processd setup [--dry-run] [--rotate-token] [--systemd=false] [--start=false]` | instala o node: diretórios, config, token, unit systemd, e imprime tudo |
 | `processd serve --config <path>` | sobe o daemon |
 | `processd status` | saúde, versão, slots, execuções rodando e na fila |
 | `processd ps [--status S] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lista execuções |
@@ -300,7 +338,7 @@ do retry.
 | `logs.retention` | `14d` | GC dos arquivos de log |
 | `ui.enabled` | `true` | console web em `/ui/` |
 | `auth.tokens[].name` | — | identifica o token na trilha de auditoria |
-| `auth.tokens[].hash` | — | `sha256:...`, gerado por `processd token hash` |
+| `auth.tokens[].hash` | — | `sha256:...`, gerado por `processd setup` ou `processd token hash`; o segredo correspondente fica em `/etc/processd/token` |
 | `auth.tokens[].workers` | `[]` = todos | restringe o token a workers específicos |
 
 Exemplos completos em [`examples/`](examples/); a especificação de cada campo, com o porquê, em

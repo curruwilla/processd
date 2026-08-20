@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+
+	"github.com/curruwilla/processd/internal/setup"
 )
 
 // client is a thin wrapper over the REST API used by every client command.
@@ -25,9 +27,28 @@ type client struct {
 func newClient() *client {
 	return &client{
 		baseURL: viper.GetString("server"),
-		token:   viper.GetString("token"),
+		token:   resolveToken(),
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// resolveToken prefers what the operator passed explicitly, and falls back to
+// the token file written by "processd setup". Without that fallback every local
+// command would need the secret repeated on the command line, which is how a
+// node ends up with several tokens and an unauthorized reply.
+func resolveToken() string {
+	if token := viper.GetString("token"); token != "" {
+		return token
+	}
+
+	// An unreadable file is not worth an error here: the request goes out
+	// without a token and the daemon answers with the usual 401.
+	token, err := setup.ReadToken(viper.GetString("config"))
+	if err != nil {
+		return ""
+	}
+
+	return token
 }
 
 // do performs a request and decodes a JSON response into out, if given.
