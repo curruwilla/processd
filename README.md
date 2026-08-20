@@ -104,7 +104,7 @@ processd stop proc_01KABCDEF...
 
 ## Desenvolvimento
 
-Requer Go 1.27+ e Linux.
+Requer Go 1.25+ e Linux.
 
 ```bash
 make install-tools     # golangci-lint e govulncheck
