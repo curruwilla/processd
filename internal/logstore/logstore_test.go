@@ -3,6 +3,7 @@ package logstore
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -262,5 +263,161 @@ func TestStore_Purge_missingRoot(t *testing.T) {
 
 	if removed != 0 {
 		t.Errorf("purge removed %d files, want 0", removed)
+	}
+}
+
+func TestTailLines(t *testing.T) {
+	t.Parallel()
+
+	write := func(t *testing.T, content string) File {
+		t.Helper()
+
+		path := filepath.Join(t.TempDir(), "log")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing fixture: %v", err)
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("opening fixture: %v", err)
+		}
+
+		t.Cleanup(func() {
+			_ = file.Close()
+		})
+
+		return File{File: file}
+	}
+
+	tests := []struct {
+		name    string
+		content string
+		tail    int
+		want    []string
+	}{
+		{name: "empty file", content: "", tail: 5, want: []string{}},
+		{name: "fewer lines than asked", content: "a\nb\n", tail: 5, want: []string{"a", "b"}},
+		{name: "exactly the last lines", content: "a\nb\nc\nd\n", tail: 2, want: []string{"c", "d"}},
+		{name: "no trailing newline", content: "a\nb\nc", tail: 2, want: []string{"b", "c"}},
+		{name: "single line", content: "only\n", tail: 3, want: []string{"only"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := tailLines(write(t, tt.content), tt.tail)
+			if err != nil {
+				t.Fatalf("tailLines() returned %v, want nil", err)
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("tailLines() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTailLines_crossesChunkBoundary(t *testing.T) {
+	t.Parallel()
+
+	// More than one 64KiB chunk, so the walk has to stitch blocks together and
+	// discard the partial line it lands on.
+	var content strings.Builder
+
+	const lines = 40_000
+
+	for i := range lines {
+		fmt.Fprintf(&content, "line-%06d\n", i)
+	}
+
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("opening fixture: %v", err)
+	}
+
+	defer func() {
+		_ = file.Close()
+	}()
+
+	got, err := tailLines(File{File: file}, 3)
+	if err != nil {
+		t.Fatalf("tailLines() returned %v, want nil", err)
+	}
+
+	want := []string{"line-039997", "line-039998", "line-039999"}
+	if !slices.Equal(got, want) {
+		t.Errorf("tailLines() = %q, want %q", got, want)
+	}
+}
+
+func TestStore_Lines_tailMatchesFullRead(t *testing.T) {
+	t.Parallel()
+
+	store := New(t.TempDir(), 1<<20)
+	at := time.Now().UTC()
+
+	attempt, err := store.Create("proc_1", 1, at, 0)
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	for i := range 5000 {
+		if _, err := fmt.Fprintf(attempt.Stdout, "out-%04d\n", i); err != nil {
+			t.Fatalf("writing stdout: %v", err)
+		}
+	}
+
+	for i := range 10 {
+		if _, err := fmt.Fprintf(attempt.Stderr, "err-%04d\n", i); err != nil {
+			t.Fatalf("writing stderr: %v", err)
+		}
+	}
+
+	if err := attempt.Close(); err != nil {
+		t.Fatalf("Close() returned %v, want nil", err)
+	}
+
+	tests := []struct {
+		name   string
+		stream Stream
+		tail   int
+	}{
+		{name: "stdout", stream: StreamStdout, tail: 7},
+		{name: "stderr", stream: StreamStderr, tail: 3},
+		{name: "both", stream: StreamBoth, tail: 12},
+		{name: "tail larger than the log", stream: StreamStderr, tail: 100},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			full, err := store.Lines("proc_1", 1, tt.stream, at, 0)
+			if err != nil {
+				t.Fatalf("Lines() returned %v, want nil", err)
+			}
+
+			tailed, err := store.Lines("proc_1", 1, tt.stream, at, tt.tail)
+			if err != nil {
+				t.Fatalf("Lines() returned %v, want nil", err)
+			}
+
+			want := full
+			if len(want) > tt.tail {
+				want = want[len(want)-tt.tail:]
+			}
+
+			// The backwards walk must return exactly what trimming a full read
+			// would have returned.
+			if !slices.Equal(tailed, want) {
+				t.Errorf("tail read = %q, want %q", tailed, want)
+			}
+		})
 	}
 }

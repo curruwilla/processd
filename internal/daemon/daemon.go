@@ -44,6 +44,8 @@ type Daemon struct {
 
 // New builds the object graph from the configuration.
 func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
+	ensureFileLimit(cfg.MaxProcesses, log)
+
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("creating data dir %q: %w", cfg.DataDir, err)
 	}

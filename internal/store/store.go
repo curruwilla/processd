@@ -63,8 +63,14 @@ type Store interface {
 	// state, used by the startup reconciliation pass.
 	UnfinishedProcesses(ctx context.Context) ([]*core.Process, error)
 
-	// CountByState reports how many executions sit in each state, for metrics
-	// and for the queue depth check.
+	// PendingCount reports how many executions are waiting for a slot. It is on
+	// the admission path of every submission, so it must stay independent of the
+	// size of the retained history.
+	PendingCount(ctx context.Context) (int, error)
+
+	// CountByState reports how many executions sit in each state. It scans the
+	// whole table, so it belongs on the metrics endpoint and nowhere near a
+	// request that runs per submission.
 	CountByState(ctx context.Context) (map[core.State]int, error)
 
 	// AcquireLock claims key for the execution, or returns core.ErrLockHeld.

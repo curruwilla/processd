@@ -118,6 +118,8 @@ linters:
           - goconst
           - dupl
           - funlen
+          # Test fixtures only ever open paths the test itself just created.
+          - gosec
       # Context parameters are part of the interfaces these methods implement;
       # the ones still unused belong to methods whose body is not written yet.
       - linters:

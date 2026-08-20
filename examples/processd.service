@@ -19,6 +19,13 @@ TimeoutStopSec=45s
 KillMode=mixed
 KillSignal=SIGTERM
 
+# Each supervised execution costs about five descriptors: two log files and both
+# ends of the stdout and stderr pipes. Budget max_processes * 5 plus a couple of
+# hundred for the daemon itself; the value below covers roughly 100k concurrent
+# executions, far past what a single node will run. The daemon logs a warning at
+# startup when this ceiling is lower than max_processes needs.
+LimitNOFILE=524288
+
 # The daemon needs privileges to drop them: it starts each process as the user
 # the worker declares.
 User=root

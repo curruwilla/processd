@@ -7,12 +7,14 @@ package logstore
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -27,9 +29,21 @@ const (
 	StreamBoth Stream = "both"
 )
 
-// maxLineBytes bounds one log line when reading, so a process that writes a
-// single huge line cannot exhaust the daemon's memory.
-const maxLineBytes = 1 << 20
+const (
+	// maxLineBytes bounds one log line when reading, so a process that writes a
+	// single huge line cannot exhaust the daemon's memory.
+	maxLineBytes = 1 << 20
+
+	// tailChunkBytes is how much of the file a backwards walk reads at a time.
+	tailChunkBytes = 64 << 10
+
+	// maxTailBytes stops the backwards walk on a file without newlines, so one
+	// enormous line cannot pull the whole log into memory.
+	maxTailBytes = 8 << 20
+)
+
+// newline is the separator the backwards walk counts.
+var newline = []byte{'\n'}
 
 const (
 	dirPerm  os.FileMode = 0o750
@@ -126,16 +140,32 @@ func (a *Attempt) Close() error {
 	return nil
 }
 
+// File is an open log file. It adds the size lookup the backwards tail walk
+// needs to the usual reader interface.
+type File struct {
+	*os.File
+}
+
+// Size reports how many bytes the log holds.
+func (f File) Size() (int64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("sizing log file: %w", err)
+	}
+
+	return info.Size(), nil
+}
+
 // Open returns a reader over one stream of one attempt.
-func (s *Store) Open(processID string, attempt int, stream Stream, at time.Time) (io.ReadCloser, error) {
+func (s *Store) Open(processID string, attempt int, stream Stream, at time.Time) (File, error) {
 	path := s.Path(processID, attempt, stream, at)
 
 	file, err := os.Open(path) //nolint:gosec // the path is derived from the configured log dir
 	if err != nil {
-		return nil, fmt.Errorf("opening log file %q: %w", path, err)
+		return File{}, fmt.Errorf("opening log file %q: %w", path, err)
 	}
 
-	return file, nil
+	return File{File: file}, nil
 }
 
 // CappedWriter writes until a byte limit is reached, then drops the rest.
@@ -211,7 +241,7 @@ func (s *Store) Lines(processID string, attempt int, stream Stream, at time.Time
 	lines := []string{}
 
 	for _, current := range streams {
-		read, err := s.readLines(processID, attempt, current, at)
+		read, err := s.readLines(processID, attempt, current, at, tail)
 		if err != nil {
 			return nil, err
 		}
@@ -232,7 +262,7 @@ func (s *Store) Lines(processID string, attempt int, stream Stream, at time.Time
 	return lines, nil
 }
 
-func (s *Store) readLines(processID string, attempt int, stream Stream, at time.Time) ([]string, error) {
+func (s *Store) readLines(processID string, attempt int, stream Stream, at time.Time, tail int) ([]string, error) {
 	file, err := s.Open(processID, attempt, stream, at)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -245,6 +275,15 @@ func (s *Store) readLines(processID string, attempt int, stream Stream, at time.
 	defer func() {
 		_ = file.Close()
 	}()
+
+	if tail > 0 {
+		lines, err := tailLines(file, tail)
+		if err != nil {
+			return nil, fmt.Errorf("reading log of %s attempt %d: %w", processID, attempt, err)
+		}
+
+		return lines, nil
+	}
 
 	lines := []string{}
 	scanner := bufio.NewScanner(file)
@@ -259,6 +298,60 @@ func (s *Store) readLines(processID string, attempt int, stream Stream, at time.
 	}
 
 	return lines, nil
+}
+
+// tailLines returns the last n lines of a file by walking it backwards.
+//
+// Reading the whole file to keep its last hundred lines costs as much memory as
+// the cap allows — with a 32MiB stream that is 32MiB per request, per stream.
+// Walking back from the end keeps the cost proportional to what is returned.
+func tailLines(file readerAt, n int) ([]string, error) {
+	size, err := file.Size()
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		buffer   []byte
+		position = size
+	)
+
+	for position > 0 && bytes.Count(buffer, newline) <= n && int64(len(buffer)) < maxTailBytes {
+		length := min(int64(tailChunkBytes), position)
+		position -= length
+
+		block := make([]byte, length)
+		if _, err := file.ReadAt(block, position); err != nil {
+			return nil, err
+		}
+
+		buffer = append(block, buffer...)
+	}
+
+	if len(buffer) == 0 {
+		return []string{}, nil
+	}
+
+	lines := strings.Split(strings.TrimRight(string(buffer), "\n"), "\n")
+
+	// The first line of the window is only whole when the walk reached the start
+	// of the file.
+	if position > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
+
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+
+	return lines, nil
+}
+
+// readerAt is the part of *os.File that tailLines needs, kept narrow so the
+// backwards walk can be tested without touching the filesystem.
+type readerAt interface {
+	ReadAt(p []byte, off int64) (int, error)
+	Size() (int64, error)
 }
 
 // Purge removes log files last written before the given instant, together with

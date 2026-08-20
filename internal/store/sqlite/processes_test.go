@@ -405,3 +405,35 @@ func TestStore_PurgeHistory_trimsToMaxRows(t *testing.T) {
 		t.Errorf("history holds %d rows, want 2", counts[core.StateCompleted])
 	}
 }
+
+func TestStore_PendingCount(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	states := map[string]core.State{
+		"proc_q1":   core.StateQueued,
+		"proc_q2":   core.StateQueued,
+		"proc_r1":   core.StateRetrying,
+		"proc_run":  core.StateRunning,
+		"proc_done": core.StateCompleted,
+		"proc_fail": core.StateFailed,
+	}
+
+	for id, state := range states {
+		if err := db.CreateProcess(ctx, newProcess(id, state)); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+	}
+
+	count, err := db.PendingCount(ctx)
+	if err != nil {
+		t.Fatalf("PendingCount() returned %v, want nil", err)
+	}
+
+	// Queued plus retrying, and nothing else: history must not affect admission.
+	if count != 3 {
+		t.Errorf("PendingCount() = %d, want 3", count)
+	}
+}

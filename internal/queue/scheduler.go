@@ -13,10 +13,20 @@ import (
 	"github.com/curruwilla/processd/internal/store"
 )
 
-// dispatchInterval is the fallback tick: most dispatches are triggered by
-// Notify, this only catches retries whose backoff elapsed with nothing else
-// happening on the node.
-const dispatchInterval = time.Second
+const (
+	// dispatchInterval is the fallback tick: most dispatches are triggered by
+	// Notify, this only catches retries whose backoff elapsed with nothing else
+	// happening on the node.
+	dispatchInterval = time.Second
+
+	// coalesceWindow batches the wake-ups that arrive together.
+	//
+	// Every finishing attempt wakes the loop, and every pass queries the pending
+	// set. Under load that turns one completion into one full scan; waiting a
+	// moment first collapses a burst of completions into a single pass, at the
+	// cost of starting queued work a few milliseconds later.
+	coalesceWindow = 25 * time.Millisecond
+)
 
 // Starter runs one attempt of an execution and supervises it.
 type Starter interface {
@@ -209,7 +219,25 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ticker.C:
 			s.dispatch(ctx)
 		case <-s.wake:
+			s.coalesce(ctx)
 			s.dispatch(ctx)
+		}
+	}
+}
+
+// coalesce absorbs the wake-ups that arrive within the batching window, so a
+// burst of completions costs one dispatch pass instead of one per completion.
+func (s *Scheduler) coalesce(ctx context.Context) {
+	timer := time.NewTimer(coalesceWindow)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.wake:
+		case <-timer.C:
+			return
 		}
 	}
 }
@@ -307,12 +335,7 @@ func (s *Scheduler) expire(ctx context.Context, p *core.Process) bool {
 
 // queueDepth counts the executions waiting for a slot.
 func (s *Scheduler) queueDepth(ctx context.Context) (int, error) {
-	counts, err := s.store.CountByState(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	return counts[core.StateQueued] + counts[core.StateRetrying], nil
+	return s.store.PendingCount(ctx)
 }
 
 // Drain stops admitting and dispatching work. Queued executions stay queued and
