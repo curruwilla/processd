@@ -5,9 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default. The code-scanning job widens it for itself.
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   govulncheck:
@@ -25,30 +25,39 @@ jobs:
       - name: Run govulncheck
         uses: golang/govulncheck-action@v1
 
-  gosec:
-    name: gosec
-    runs-on: ubuntu-latest
+  # gosec has no job of its own on purpose. It already runs over the whole tree
+  # in the lint workflow through golangci-lint, where each accepted finding
+  # carries a justified //nolint:gosec directive. A standalone gosec run only
+  # honours #nosec, so it would re-report exactly those and need a second,
+  # duplicated suppression list. (The securego/gosec action also publishes no
+  # floating v2 tag, which is what broke this workflow before.)
 
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Run gosec
-        uses: securego/gosec@v2
-        with:
-          args: -no-fail -fmt sarif -out gosec-results.sarif ./...
-
-      - name: Upload gosec results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: gosec-results.sarif
+  # Bearer was dropped for the same reason: its Go rules are the gosec ruleset
+  # (rule ids are literally go_gosec_*), it cannot see //nolint directives, and
+  # on this repository it reports nine findings that are all either already
+  # justified in code or false positives from concatenating compile-time SQL
+  # constants around bound ? parameters.
 
   codeql:
     name: CodeQL
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      # Publishing results to code scanning, free on public repositories.
+      security-events: write
+      # The CodeQL action reads the workflow run it belongs to.
+      actions: read
+
     steps:
       - uses: actions/checkout@v6
+
+      # The runner image may ship a Go older than the go directive in go.mod,
+      # which would fail autobuild the same way it failed the test job.
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -61,22 +70,3 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
-
-  bearer:
-    name: Bearer
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Bearer Security Scan
-        uses: bearer/bearer-action@v2
-        with:
-          format: sarif
-          output: bearer-results.sarif
-
-      - name: Upload Bearer results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: bearer-results.sarif
