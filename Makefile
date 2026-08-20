@@ -11,7 +11,7 @@ LDFLAGS := -ldflags "-s -w \
 	-X $(PKG).Commit=$(COMMIT) \
 	-X $(PKG).Date=$(DATE)"
 
-.PHONY: all build clean test test-race test-integration cover lint lint-fix fmt vet audit tidy install-tools help
+.PHONY: all build clean test test-race test-integration cover lint lint-fix fmt vet audit tidy release-check release-snapshot release-docker install-tools help
 
 all: fmt vet lint test build
 
@@ -65,10 +65,24 @@ audit:
 tidy:
 	$(GO) mod tidy
 
+## release-check: Validate the GoReleaser configuration
+release-check:
+	goreleaser check
+
+## release-snapshot: Build archives, packages and SBOMs into dist/, without publishing
+release-snapshot:
+	goreleaser release --snapshot --clean --skip=publish,sign,docker
+
+## release-docker: Build the container image locally (needs docker buildx and qemu for arm64)
+release-docker:
+	goreleaser release --snapshot --clean --skip=publish,sign,sbom
+
 ## install-tools: Install the development tools used by this Makefile
 install-tools:
 	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	$(GO) install github.com/goreleaser/goreleaser/v2@latest
+	$(GO) install github.com/anchore/syft/cmd/syft@latest
 
 ## help: Show this help message
 help:

@@ -1,0 +1,179 @@
+version: 2
+
+project_name: processd
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: processd
+    main: ./cmd/processd
+    binary: processd
+    env:
+      - CGO_ENABLED=0
+    # The runner reads /proc and uses Linux-only syscalls, so Linux is the
+    # only target that compiles.
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/curruwilla/processd/internal/version.Version={{ .Version }}
+      - -X github.com/curruwilla/processd/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/curruwilla/processd/internal/version.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: processd
+    ids:
+      - processd
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - examples
+
+nfpms:
+  - id: processd
+    ids:
+      - processd
+    package_name: processd
+    vendor: processd
+    homepage: https://github.com/curruwilla/processd
+    maintainer: William Alvares <curruwilla@gmail.com>
+    description: |-
+      Lightweight process manager that runs and supervises CLI processes
+      through a REST API.
+    license: Apache-2.0
+    section: admin
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    contents:
+      # The package installs the binary and the examples only. Everything under
+      # /etc/processd, plus the systemd unit and the API token, belongs to
+      # `processd setup`, which points the unit at the binary that runs it.
+      - dst: /etc/processd/workers.d
+        type: dir
+        file_info:
+          mode: 0o755
+      - src: examples/processd.yaml
+        dst: /usr/share/doc/processd/examples/processd.yaml
+      - src: examples/processd.service
+        dst: /usr/share/doc/processd/examples/processd.service
+      - src: examples/workers.d/invoice.yaml
+        dst: /usr/share/doc/processd/examples/workers.d/invoice.yaml
+      - src: LICENSE
+        dst: /usr/share/doc/processd/LICENSE
+    scripts:
+      postinstall: packaging/nfpm/postinstall.sh
+
+dockers_v2:
+  - id: processd
+    ids:
+      - processd
+    images:
+      - ghcr.io/curruwilla/processd
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    extra_files:
+      - packaging/docker/entrypoint.sh
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: Lightweight process manager for CLI processes, driven by a REST API
+      org.opencontainers.image.licenses: Apache-2.0
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  # One SPDX document per archive and per Linux package: every Go module that
+  # went into the binary, with its version, so an operator can answer "is this
+  # install affected?" without rebuilding anything.
+  - id: archive
+    artifacts: archive
+    documents:
+      - "${artifact}.spdx.json"
+    args:
+      - $artifact
+      - --output
+      - spdx-json=$document
+  - id: package
+    artifacts: package
+    documents:
+      - "${artifact}.spdx.json"
+    args:
+      - $artifact
+      - --output
+      - spdx-json=$document
+
+signs:
+  # Keyless cosign: the signature is bound to the GitHub Actions identity of
+  # this workflow, and recorded in the public Rekor transparency log. There is
+  # no private key to store or rotate. Signing checksums.txt covers every
+  # artifact listed in it.
+  - id: checksums
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+    artifacts: checksum
+    output: true
+
+docker_signs:
+  # Empty `artifacts` means the images built by dockers_v2.
+  - id: images
+    cmd: cosign
+    artifacts: ""
+    args:
+      - sign
+      - "${artifact}@${digest}"
+      - --yes
+    output: true
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "^style:"
+
+release:
+  # A tag such as v0.1.0-rc1 is published as a pre-release.
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```bash
+    tar -xzf processd_{{ .Version }}_linux_amd64.tar.gz
+    sudo install -m 0755 processd /usr/local/bin/processd
+    sudo processd setup
+    ```

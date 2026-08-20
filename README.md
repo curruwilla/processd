@@ -59,11 +59,102 @@ Não substitui o systemd para serviços de sistema.
 
 ### 1. Instalar
 
+Baixe o binário da release mais recente (Linux `amd64` ou `arm64`):
+
+```bash
+VERSION=0.1.0                               # ver github.com/curruwilla/processd/releases
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/processd_${VERSION}_linux_${ARCH}.tar.gz"
+tar -xzf "processd_${VERSION}_linux_${ARCH}.tar.gz" processd
+sudo install -m 0755 processd /usr/local/bin/processd
+```
+
+Cada release publica também `checksums.txt`, para conferir o download:
+
+```bash
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/checksums.txt"
+sha256sum --check --ignore-missing checksums.txt
+```
+
+Ou instale o pacote da sua distro (`.deb`, `.rpm`, `.apk`, `amd64` e `arm64`):
+
+```bash
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/processd_${VERSION}_linux_${ARCH}.deb"
+sudo dpkg -i "processd_${VERSION}_linux_${ARCH}.deb"    # ou: sudo rpm -i ...rpm
+```
+
+O pacote instala só o binário em `/usr/bin/processd` e os exemplos em
+`/usr/share/doc/processd/examples/`. Config, token e unit continuam sendo do `processd setup`, que
+aponta a unit para o binário que o executou.
+
+Ou compile a partir do código:
+
 ```bash
 git clone https://github.com/curruwilla/processd && cd processd
 make build                                  # bin/processd, build sem CGO
 sudo install -m 0755 bin/processd /usr/local/bin/processd
 ```
+
+<details>
+<summary>Container</summary>
+
+```bash
+docker run -d --name processd \
+  -p 7373:7373 \
+  -v processd-etc:/etc/processd \
+  -v processd-data:/var/lib/processd \
+  -v processd-logs:/var/log/processd \
+  ghcr.io/curruwilla/processd:${VERSION}
+```
+
+No primeiro start o entrypoint roda `processd setup` dentro do container: escreve
+`/etc/processd/processd.yaml`, gera o token e imprime tudo no log (`docker logs processd`). O bind
+padrão vira `0.0.0.0:7373`; mude com `-e PROCESSD_LISTEN=...`. Os três volumes preservam token,
+workers, banco e logs entre restarts.
+
+A imagem é Alpine, não `scratch`: o daemon supervisiona processos CLI, então precisa de um userland
+onde os comandos dos workers existam. Instale no container o que seus workers chamam.
+
+</details>
+
+<details>
+<summary>Verificar assinatura e SBOM</summary>
+
+O `checksums.txt` de cada release é assinado com [cosign](https://docs.sigstore.dev/) em modo
+keyless: a assinatura fica atrelada à identidade do workflow que publicou a release, não a uma
+chave privada. Verificar exige cosign v2+:
+
+```bash
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/checksums.txt"
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/checksums.txt.sigstore.json"
+
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity "https://github.com/curruwilla/processd/.github/workflows/release.yml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  checksums.txt
+```
+
+Com o `checksums.txt` verificado, o `sha256sum --check` acima já garante os binários e pacotes.
+
+A imagem do container também é assinada:
+
+```bash
+cosign verify ghcr.io/curruwilla/processd:${VERSION} \
+  --certificate-identity "https://github.com/curruwilla/processd/.github/workflows/release.yml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+Cada arquivo `.tar.gz`, `.deb`, `.rpm` e `.apk` vem com um SBOM SPDX ao lado
+(`<artefato>.spdx.json`): a lista de todos os módulos Go que entraram no binário, com versão. Serve
+para responder "essa instalação é afetada por esse CVE?" sem recompilar:
+
+```bash
+curl -fsSLO "https://github.com/curruwilla/processd/releases/download/v${VERSION}/processd_${VERSION}_linux_${ARCH}.tar.gz.spdx.json"
+jq -r '.packages[] | "\(.name) \(.versionInfo)"' "processd_${VERSION}_linux_${ARCH}.tar.gz.spdx.json"
+```
+
+</details>
 
 ### 2. Preparar o node
 
@@ -357,6 +448,19 @@ make test-race         # testes com detector de corrida
 make test-integration  # testes ponta a ponta (sobe daemons e processos reais)
 make lint              # golangci-lint
 make fmt               # formatação
+make release-check     # valida .goreleaser.yml
+make release-snapshot  # gera archives, pacotes e SBOMs em dist/, sem publicar
+make release-docker    # constrói a imagem do container localmente
+```
+
+Releases são automáticas: um push de tag `v*` dispara
+[`.github/workflows/release.yml`](.github/workflows/release.yml), que roda os testes, o GoReleaser
+e publica na release do GitHub os `.tar.gz`, os pacotes `.deb`/`.rpm`/`.apk`, um SBOM SPDX por
+artefato, o `checksums.txt` e a assinatura cosign dele. No mesmo passo sobem as imagens
+`ghcr.io/curruwilla/processd` (`amd64` e `arm64`), também assinadas.
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 ```
 
 Layout:
