@@ -11,7 +11,7 @@ LDFLAGS := -ldflags "-s -w \
 	-X $(PKG).Commit=$(COMMIT) \
 	-X $(PKG).Date=$(DATE)"
 
-.PHONY: all build clean test test-race cover lint lint-fix fmt vet audit tidy install-tools help
+.PHONY: all build clean test test-race test-integration cover lint lint-fix fmt vet audit tidy install-tools help
 
 all: fmt vet lint test build
 
@@ -31,6 +31,10 @@ test:
 ## test-race: Run the test suite with the race detector
 test-race:
 	$(GO) test -race ./...
+
+## test-integration: Run the end-to-end tests (starts real daemons and processes)
+test-integration:
+	$(GO) test -tags=integration -race -count=1 ./...
 
 ## cover: Run tests and write an HTML coverage report
 cover:

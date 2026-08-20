@@ -1,21 +1,35 @@
 package api
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/core"
+	"github.com/curruwilla/processd/internal/logstore"
 	"github.com/curruwilla/processd/internal/runner"
+	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/version"
 )
 
-// maxRequestBody bounds request bodies; nothing this API accepts is large.
-const maxRequestBody = 1 << 20
+const (
+	// maxRequestBody bounds request bodies; nothing this API accepts is large.
+	maxRequestBody = 1 << 20
+	// idempotencyHeader carries the client-chosen key that makes a repeated
+	// submission return the original execution instead of starting a new one.
+	idempotencyHeader = "Idempotency-Key"
+)
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.log, http.StatusOK, healthResponse{
@@ -72,9 +86,30 @@ func (s *Server) reloadWorkers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
-	var req createProcessRequest
-	if err := decodeJSON(r, &req); err != nil {
+	body, err := readBody(r)
+	if err != nil {
 		writeError(w, s.log, err)
+		return
+	}
+
+	var req createProcessRequest
+	if err := decodeJSON(body, &req); err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	key := r.Header.Get(idempotencyHeader)
+
+	replayed, err := s.replayIdempotent(r, key, body)
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	if replayed != nil {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, s.log, http.StatusOK, newCreateResponse(replayed))
+
 		return
 	}
 
@@ -89,23 +124,15 @@ func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.rememberIdempotent(r, key, body, process.ID)
+	s.audit(r, "create", process.ID, process.Worker)
+
 	status := http.StatusCreated
 	if process.State == core.StateQueued {
 		status = http.StatusAccepted
 	}
 
-	response := createProcessResponse{
-		ID:      process.ID,
-		Status:  process.State,
-		Attempt: process.Attempt,
-	}
-
-	if process.PID > 0 {
-		pid := process.PID
-		response.PID = &pid
-	}
-
-	writeJSON(w, s.log, status, response)
+	writeJSON(w, s.log, status, newCreateResponse(process))
 }
 
 // buildProcess turns a request into the effective execution definition. The
@@ -289,17 +316,27 @@ func (s *Server) deleteProcess(w http.ResponseWriter, r *http.Request) {
 		grace = parsed
 	}
 
-	if err := s.supervisor.Stop(r.Context(), r.PathValue("id"), grace); err != nil {
+	id := r.PathValue("id")
+
+	if err := s.supervisor.Stop(r.Context(), id, grace); err != nil {
 		writeError(w, s.log, err)
 		return
 	}
+
+	s.audit(r, "stop", id, grace.String())
 
 	writeJSON(w, s.log, http.StatusAccepted, nil)
 }
 
 func (s *Server) signalProcess(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
 	var req signalRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(body, &req); err != nil {
 		writeError(w, s.log, err)
 		return
 	}
@@ -315,27 +352,132 @@ func (s *Server) signalProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.supervisor.Signal(r.Context(), r.PathValue("id"), req.Signal); err != nil {
+	id := r.PathValue("id")
+
+	if err := s.supervisor.Signal(r.Context(), id, req.Signal); err != nil {
 		writeError(w, s.log, err)
 		return
 	}
 
+	s.audit(r, "signal", id, req.Signal)
+
 	writeJSON(w, s.log, http.StatusAccepted, nil)
 }
 
-func (s *Server) processLogs(w http.ResponseWriter, _ *http.Request) {
-	// TODO(spec §6.8): resolve the attempt, stream the capped log files.
-	writeError(w, s.log, &apiError{
-		Status:  http.StatusNotImplemented,
-		Code:    "not_implemented",
-		Message: "log retrieval is not implemented yet",
+func (s *Server) processLogs(w http.ResponseWriter, r *http.Request) {
+	process, err := s.store.GetProcess(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	stream, err := parseStream(r.URL.Query().Get("stream"))
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	attempt, err := parseAttempt(r.URL.Query().Get("attempt"), process.Attempt)
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	tail, err := parsePositive(r.URL.Query().Get("tail"), "tail")
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	// Logs are addressed by the execution's creation time, which never moves,
+	// so a retry reads back exactly the attempt it asks for.
+	lines, err := s.logs.Lines(process.ID, attempt, stream, process.CreatedAt, tail)
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	writeJSON(w, s.log, http.StatusOK, logsResponse{
+		Attempt:   attempt,
+		Stream:    string(stream),
+		Lines:     lines,
+		Truncated: process.LogTruncated,
 	})
 }
 
-// decodeJSON reads a bounded, strict JSON body: unknown fields are a client
-// error rather than a silently ignored typo.
-func decodeJSON(r *http.Request, out any) error {
-	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxRequestBody))
+// replayIdempotent returns the execution a repeated Idempotency-Key already
+// produced, or nil when the request is new.
+func (s *Server) replayIdempotent(r *http.Request, key string, body []byte) (*core.Process, error) {
+	if key == "" {
+		return nil, nil
+	}
+
+	record, err := s.store.FindIdempotency(r.Context(), key)
+	if errors.Is(err, core.ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if record.RequestHash != hashBody(body) {
+		return nil, fmt.Errorf("key %q: %w", key, core.ErrIdempotencyReuse)
+	}
+
+	return s.store.GetProcess(r.Context(), record.ProcessID)
+}
+
+// rememberIdempotent records the key so a client retry never starts the work
+// twice. A failure here is logged, not returned: the execution already exists.
+func (s *Server) rememberIdempotent(r *http.Request, key string, body []byte, processID string) {
+	if key == "" {
+		return
+	}
+
+	err := s.store.SaveIdempotency(r.Context(), store.Idempotency{
+		Key:         key,
+		RequestHash: hashBody(body),
+		ProcessID:   processID,
+		CreatedAt:   time.Now().UTC(),
+	})
+	if err != nil {
+		s.log.Error("saving idempotency key", slog.String("key", key), slog.Any("error", err))
+	}
+}
+
+// audit records who asked for what. A failure to write the trail must not fail
+// the request that already happened.
+func (s *Server) audit(r *http.Request, action, processID, detail string) {
+	token, _ := tokenFrom(r.Context())
+
+	err := s.store.AppendAudit(r.Context(), store.AuditEntry{
+		At:        time.Now().UTC(),
+		TokenName: token.Name,
+		Action:    action,
+		ProcessID: processID,
+		Detail:    detail,
+	})
+	if err != nil {
+		s.log.Error("appending audit entry", slog.String("action", action), slog.Any("error", err))
+	}
+}
+
+// readBody reads a bounded request body. The bytes are kept so that the same
+// payload can be both decoded and hashed for idempotency.
+func readBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBody))
+	if err != nil {
+		return nil, badRequest("invalid_body", "request body is too large or unreadable")
+	}
+
+	return body, nil
+}
+
+// decodeJSON decodes a strict JSON body: unknown fields are a client error
+// rather than a silently ignored typo.
+func decodeJSON(body []byte, out any) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(out); err != nil {
@@ -343,6 +485,74 @@ func decodeJSON(r *http.Request, out any) error {
 	}
 
 	return nil
+}
+
+// hashBody fingerprints a request so a repeated idempotency key can be checked
+// against the payload it was first used with.
+func hashBody(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func parseStream(raw string) (logstore.Stream, error) {
+	switch logstore.Stream(raw) {
+	case "":
+		return logstore.StreamBoth, nil
+	case logstore.StreamStdout:
+		return logstore.StreamStdout, nil
+	case logstore.StreamStderr:
+		return logstore.StreamStderr, nil
+	case logstore.StreamBoth:
+		return logstore.StreamBoth, nil
+	default:
+		return "", badRequest("stream_unknown", fmt.Sprintf("stream %q is unknown", raw))
+	}
+}
+
+func parseAttempt(raw string, current int) (int, error) {
+	if raw == "" {
+		return max(current, 1), nil
+	}
+
+	attempt, err := strconv.Atoi(raw)
+	if err != nil || attempt < 1 {
+		return 0, badRequest("attempt_invalid", fmt.Sprintf("attempt %q is not a positive integer", raw))
+	}
+
+	if attempt > current {
+		return 0, badRequest("attempt_unknown", fmt.Sprintf("attempt %d has not run", attempt))
+	}
+
+	return attempt, nil
+}
+
+func parsePositive(raw, name string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, badRequest(name+"_invalid", fmt.Sprintf("%s %q is not a positive integer", name, raw))
+	}
+
+	return value, nil
+}
+
+// newCreateResponse renders the answer to a submission.
+func newCreateResponse(p *core.Process) createProcessResponse {
+	response := createProcessResponse{
+		ID:      p.ID,
+		Status:  p.State,
+		Attempt: p.Attempt,
+	}
+
+	if p.PID > 0 {
+		pid := p.PID
+		response.PID = &pid
+	}
+
+	return response
 }
 
 func describeParam(param config.Param) string {

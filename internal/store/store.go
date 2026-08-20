@@ -28,7 +28,7 @@ type Page struct {
 	NextCursor string
 }
 
-// Idempotency records the response produced for an Idempotency-Key so that a
+// Idempotency records the execution produced for an Idempotency-Key so that a
 // client retry never starts the same work twice.
 type Idempotency struct {
 	Key         string
@@ -37,18 +37,39 @@ type Idempotency struct {
 	CreatedAt   time.Time
 }
 
-// Store persists executions, locks and idempotency keys.
+// AuditEntry records who asked for what. It is written for every state-changing
+// API call, so that an execution can always be traced back to a token.
+type AuditEntry struct {
+	At        time.Time
+	TokenName string
+	Action    string
+	ProcessID string
+	Detail    string
+}
+
+// Store persists executions, locks, idempotency keys and the audit trail.
 type Store interface {
 	CreateProcess(ctx context.Context, p *core.Process) error
 	UpdateProcess(ctx context.Context, p *core.Process) error
 	GetProcess(ctx context.Context, id string) (*core.Process, error)
 	ListProcesses(ctx context.Context, f Filter) (Page, error)
 
+	// PendingProcesses returns the executions the scheduler may start now:
+	// everything queued, plus the retries whose backoff has elapsed. Oldest
+	// first, so the queue stays fair.
+	PendingProcesses(ctx context.Context, now time.Time) ([]*core.Process, error)
+
 	// UnfinishedProcesses returns every execution that was not in a terminal
 	// state, used by the startup reconciliation pass.
 	UnfinishedProcesses(ctx context.Context) ([]*core.Process, error)
 
+	// CountByState reports how many executions sit in each state, for metrics
+	// and for the queue depth check.
+	CountByState(ctx context.Context) (map[core.State]int, error)
+
 	// AcquireLock claims key for the execution, or returns core.ErrLockHeld.
+	// Re-acquiring a lock the same execution already holds succeeds, so a retry
+	// never loses its own lock.
 	AcquireLock(ctx context.Context, key, processID string) error
 	// ReleaseLock frees key if it is still held by the execution.
 	ReleaseLock(ctx context.Context, key, processID string) error
@@ -56,10 +77,13 @@ type Store interface {
 	ActiveLocks(ctx context.Context) (map[string]string, error)
 
 	SaveIdempotency(ctx context.Context, record Idempotency) error
+	// FindIdempotency returns a stored key, or core.ErrNotFound.
 	FindIdempotency(ctx context.Context, key string) (Idempotency, error)
 
-	// PurgeHistory deletes terminal executions older than before, keeping at
-	// most maxRows rows. It returns how many rows were removed.
+	AppendAudit(ctx context.Context, entry AuditEntry) error
+
+	// PurgeHistory deletes terminal executions older than before, then trims the
+	// history to maxRows. It returns how many rows were removed.
 	PurgeHistory(ctx context.Context, before time.Time, maxRows int) (int, error)
 
 	Close() error

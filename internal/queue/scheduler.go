@@ -13,7 +13,12 @@ import (
 	"github.com/curruwilla/processd/internal/store"
 )
 
-// Starter runs one execution to completion, including retries.
+// dispatchInterval is the fallback tick: most dispatches are triggered by
+// Notify, this only catches retries whose backoff elapsed with nothing else
+// happening on the node.
+const dispatchInterval = time.Second
+
+// Starter runs one attempt of an execution and supervises it.
 type Starter interface {
 	Start(ctx context.Context, p *core.Process) error
 }
@@ -81,14 +86,120 @@ func (s *Scheduler) Submit(ctx context.Context, p *core.Process) error {
 		return core.ErrShuttingDown
 	}
 
-	// TODO(spec §14): check queue depth, persist as CREATED, then try to
-	// acquire slot and lock; transition to STARTING or QUEUED accordingly.
-	return fmt.Errorf("submitting %s: %w", p.ID, errNotImplemented)
+	depth, err := s.queueDepth(ctx)
+	if err != nil {
+		return err
+	}
+
+	if depth >= s.cfg.Queue.MaxDepth {
+		return fmt.Errorf("queue holds %d executions: %w", depth, core.ErrQueueFull)
+	}
+
+	if err := s.store.CreateProcess(ctx, p); err != nil {
+		return err
+	}
+
+	return s.admit(ctx, p)
+}
+
+// admit tries to start an execution right away, queueing it when a slot or its
+// lock is unavailable.
+func (s *Scheduler) admit(ctx context.Context, p *core.Process) error {
+	worker := s.worker(p.Worker)
+
+	// A worker configured to reject on lock conflicts must answer immediately
+	// rather than sit in the queue, so the lock is claimed before the slot.
+	if p.Lock != "" && lockConflict(worker) == config.LockConflictReject {
+		if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
+			if errors.Is(err, core.ErrLockHeld) {
+				return s.rejectLocked(ctx, p, err)
+			}
+
+			return err
+		}
+	}
+
+	if !s.slots.TryAcquire(p.Worker) {
+		return s.enqueue(ctx, p)
+	}
+
+	if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
+		s.slots.Release(p.Worker)
+
+		if errors.Is(err, core.ErrLockHeld) {
+			return s.enqueue(ctx, p)
+		}
+
+		return err
+	}
+
+	return s.launch(ctx, p)
+}
+
+// rejectLocked records the execution that lost a lock race and reports 409. The
+// row is kept: an execution that was refused is part of the history.
+func (s *Scheduler) rejectLocked(ctx context.Context, p *core.Process, cause error) error {
+	if err := p.TransitionTo(core.StateCanceled, core.ReasonLockConflict); err != nil {
+		return err
+	}
+
+	if err := s.store.UpdateProcess(ctx, p); err != nil {
+		return err
+	}
+
+	return cause
+}
+
+// enqueue parks an execution until a slot and its lock are both free.
+func (s *Scheduler) enqueue(ctx context.Context, p *core.Process) error {
+	if err := p.TransitionTo(core.StateQueued, ""); err != nil {
+		return err
+	}
+
+	queuedAt := time.Now().UTC()
+	p.QueuedAt = &queuedAt
+
+	return s.store.UpdateProcess(ctx, p)
+}
+
+// launch starts the next attempt of an execution that already holds its slot
+// and lock.
+func (s *Scheduler) launch(ctx context.Context, p *core.Process) error {
+	p.Attempt++
+	p.ClearAttempt()
+	p.RetryAt = nil
+
+	if err := p.TransitionTo(core.StateStarting, ""); err != nil {
+		s.releaseAll(ctx, p)
+		return err
+	}
+
+	if err := s.store.UpdateProcess(ctx, p); err != nil {
+		s.releaseAll(ctx, p)
+		return err
+	}
+
+	if err := s.starter.Start(ctx, p); err != nil {
+		s.releaseAll(ctx, p)
+		return err
+	}
+
+	return nil
+}
+
+// releaseAll gives back what launch had reserved, so a failure to start never
+// leaks a slot or a lock.
+func (s *Scheduler) releaseAll(ctx context.Context, p *core.Process) {
+	s.slots.Release(p.Worker)
+
+	if err := s.store.ReleaseLock(ctx, p.Lock, p.ID); err != nil {
+		s.log.Error("releasing lock", slog.String("process", p.ID), slog.Any("error", err))
+	}
 }
 
 // Run drives the dispatch loop until the context is cancelled.
 func (s *Scheduler) Run(ctx context.Context) error {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(dispatchInterval)
 	defer ticker.Stop()
 
 	for {
@@ -111,22 +222,120 @@ func (s *Scheduler) Notify() {
 	}
 }
 
-// dispatch starts every queued execution that has become eligible.
+// OnAttemptFinished frees the slot an attempt held and looks for more work.
+func (s *Scheduler) OnAttemptFinished(p *core.Process) {
+	s.slots.Release(p.Worker)
+	s.Notify()
+}
+
+// dispatch starts every pending execution that has become eligible.
 //
-// It scans for the first *eligible* item rather than only the head: an item
-// blocked by a lock or by its worker limit must not stall the whole queue.
+// It scans for eligible items rather than only the head of the queue: an item
+// blocked by its lock or by its worker limit must not stall everything behind
+// it.
 func (s *Scheduler) dispatch(ctx context.Context) {
 	if s.draining.Load() {
 		return
 	}
 
-	// TODO(spec §14.2): load queued executions, expire the ones past
-	// queue.item_ttl, and start those whose slot and lock are both available.
-	_ = ctx
+	pending, err := s.store.PendingProcesses(ctx, time.Now().UTC())
+	if err != nil {
+		s.log.Error("reading pending executions", slog.Any("error", err))
+		return
+	}
+
+	for _, p := range pending {
+		// Expiry runs even when the node is full: an execution that waited past
+		// its TTL must be failed whether or not a slot ever frees up.
+		if s.expire(ctx, p) {
+			continue
+		}
+
+		if !s.slots.TryAcquire(p.Worker) {
+			continue
+		}
+
+		if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
+			s.slots.Release(p.Worker)
+
+			if !errors.Is(err, core.ErrLockHeld) {
+				s.log.Error("acquiring lock", slog.String("process", p.ID), slog.Any("error", err))
+			}
+
+			continue
+		}
+
+		if err := s.launch(ctx, p); err != nil {
+			s.log.Error("starting execution", slog.String("process", p.ID), slog.Any("error", err))
+		}
+	}
+}
+
+// expire fails an execution that waited in the queue longer than item_ttl.
+func (s *Scheduler) expire(ctx context.Context, p *core.Process) bool {
+	ttl := s.cfg.Queue.ItemTTL.Duration()
+	if ttl <= 0 || p.State != core.StateQueued {
+		return false
+	}
+
+	waiting := p.CreatedAt
+	if p.QueuedAt != nil {
+		waiting = *p.QueuedAt
+	}
+
+	if time.Since(waiting) <= ttl {
+		return false
+	}
+
+	if err := p.TransitionTo(core.StateFailed, core.ReasonQueueTimeout); err != nil {
+		s.log.Error("expiring queued execution", slog.String("process", p.ID), slog.Any("error", err))
+		return false
+	}
+
+	if err := s.store.ReleaseLock(ctx, p.Lock, p.ID); err != nil {
+		s.log.Error("releasing lock", slog.String("process", p.ID), slog.Any("error", err))
+	}
+
+	if err := s.store.UpdateProcess(ctx, p); err != nil {
+		s.log.Error("expiring queued execution", slog.String("process", p.ID), slog.Any("error", err))
+	}
+
+	s.log.Warn("execution expired in queue", slog.String("process", p.ID), slog.Duration("ttl", ttl))
+
+	return true
+}
+
+// queueDepth counts the executions waiting for a slot.
+func (s *Scheduler) queueDepth(ctx context.Context) (int, error) {
+	counts, err := s.store.CountByState(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return counts[core.StateQueued] + counts[core.StateRetrying], nil
 }
 
 // Drain stops admitting and dispatching work. Queued executions stay queued and
 // are picked up again after a restart.
 func (s *Scheduler) Drain() { s.draining.Store(true) }
 
-var errNotImplemented = errors.New("not implemented")
+func (s *Scheduler) worker(name string) *config.Worker {
+	if name == "" {
+		return nil
+	}
+
+	worker, err := s.Registry().Get(name)
+	if err != nil {
+		return nil
+	}
+
+	return worker
+}
+
+func lockConflict(worker *config.Worker) config.LockConflict {
+	if worker == nil || worker.LockConflict == "" {
+		return config.LockConflictQueue
+	}
+
+	return worker.LockConflict
+}

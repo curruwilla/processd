@@ -11,28 +11,28 @@ Fica no espaço entre supervisores locais (Supervisor, PM2) e orquestradores dis
 
 ## Status
 
-**Pré-alpha.** O esqueleto em Go existe e compila; o daemon sobe, autentica e valida requisições,
-mas ainda não executa processos — persistência, fila e supervisão estão como stubs marcados com
-`TODO(spec §…)`.
+**Alpha — MVP completo.** O daemon executa, supervisiona, persiste e recupera processos de verdade.
+Ainda não foi usado em produção: trate a primeira instalação como piloto.
 
 | Área | Estado |
 |---|---|
-| API REST, auth por token, contrato de erro | implementado |
-| Config do daemon e workers (YAML estrito) | implementado |
-| Validação de params e montagem de argv | implementado |
-| Execução: process group, uid/gid, env limpo, sinais, timeout | implementado |
-| Captura de logs por tentativa com limite de tamanho | implementado |
-| Fingerprint `(pid, starttime)` contra reciclagem de PID | implementado |
-| Backoff com jitter, contagem de slots | implementado |
-| Máquina de estados | implementada |
-| Persistência SQLite (schema e migrations prontos, CRUD pendente) | **pendente** |
-| Scheduler, fila, locks | **pendente** |
-| Supervisão de execuções, retry, reconciliação | **pendente** |
-| Leitura de logs pela API | **pendente** |
+| API REST, auth por token, contrato de erro, idempotência, paginação | pronto |
+| Config do daemon e workers (YAML estrito), reload por SIGHUP | pronto |
+| Validação de params e montagem de argv | pronto |
+| Execução: process group, uid/gid, env limpo, sinais, timeout | pronto |
+| Fila, limites global e por worker, TTL de fila | pronto |
+| Locks persistidos (`queue` e `reject`) | pronto |
+| Retry com backoff, jitter, `reset_after`, exit codes fatais | pronto |
+| Captura de logs por tentativa, com limite de tamanho e leitura pela API | pronto |
+| Persistência SQLite, histórico e trilha de auditoria | pronto |
+| Crash recovery: fingerprint `(pid, starttime)`, `orphan_policy` | pronto |
+| Graceful shutdown do daemon e da árvore de processos | pronto |
+| Retenção e GC de histórico e de logs | pronto |
+| Métricas Prometheus em `/v1/metrics` | pronto |
+| CLI completa | pronto |
 
-A spec completa está em **[docs/SPEC.md](docs/SPEC.md)**.
-
----
+Fora do MVP, por decisão: `type: service` e desired state, streaming de logs, execução distribuída
+(Agents), TLS nativo, Web UI. Ver [docs/SPEC.md](docs/SPEC.md) §22 e §25.
 
 ## O que faz
 
@@ -100,9 +100,6 @@ processd logs proc_01KABCDEF...
 processd stop proc_01KABCDEF...
 ```
 
-Hoje respondem de verdade: `status`, `workers`, `reload`, `token hash`, e a validação completa de
-`POST /v1/processes` (que ainda falha na hora de enfileirar).
-
 ---
 
 ## Desenvolvimento
@@ -110,11 +107,12 @@ Hoje respondem de verdade: `status`, `workers`, `reload`, `token hash`, e a vali
 Requer Go 1.27+ e Linux.
 
 ```bash
-make install-tools   # golangci-lint e govulncheck
-make build           # bin/processd
-make test-race       # testes com detector de corrida
-make lint            # golangci-lint
-make fmt             # formatação
+make install-tools     # golangci-lint e govulncheck
+make build             # bin/processd
+make test-race         # testes com detector de corrida
+make test-integration  # testes ponta a ponta (sobe daemons e processos reais)
+make lint              # golangci-lint
+make fmt               # formatação
 ```
 
 Layout:
@@ -164,9 +162,9 @@ Detalhes em [docs/SPEC.md §16](docs/SPEC.md).
 
 | Fase | Entrega |
 |---|---|
-| 1 | Process manager local: API, estados, persistência, auth |
-| 2 | Supervisor: fila, locks, retry/backoff, timeout, recovery |
-| 3 | Observabilidade: métricas, streaming de logs, histórico |
+| 1 ✅ | Process manager local: API, estados, persistência, auth |
+| 2 ✅ | Supervisor: fila, locks, retry/backoff, timeout, recovery |
+| 3 | Observabilidade: streaming de logs, CPU/memória, Web UI |
 | 4 | `type: service` e desired state local |
 | 5 | Agents e execução distribuída |
 

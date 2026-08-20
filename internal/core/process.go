@@ -1,6 +1,10 @@
 package core
 
-import "time"
+import (
+	"maps"
+	"slices"
+	"time"
+)
 
 // Type distinguishes one-shot work from long-running work. Their retry, queue
 // and terminal-state semantics are opposites, so the distinction is explicit in
@@ -28,6 +32,8 @@ const (
 	ReasonDaemonRestart Reason = "daemon_restart"
 	ReasonStartError    Reason = "start_error"
 	ReasonNoRetryExit   Reason = "no_retry_exit_code"
+	ReasonLockConflict  Reason = "lock_conflict"
+	ReasonOrphaned      Reason = "orphaned"
 )
 
 // Process is one execution, identified by a stable logical ID that survives
@@ -102,4 +108,38 @@ func (p *Process) ClearAttempt() {
 	p.LogTruncated = false
 	p.StartedAt = nil
 	p.FinishedAt = nil
+}
+
+// Clone returns a deep copy of the execution.
+//
+// The scheduler hands an execution to the supervisor and then answers the
+// request that created it; both would otherwise read and write the same struct
+// from different goroutines. Ownership is therefore transferred by value: the
+// supervisor mutates its own copy, and the store stays the shared truth.
+func (p *Process) Clone() *Process {
+	if p == nil {
+		return nil
+	}
+
+	clone := *p
+	clone.Args = slices.Clone(p.Args)
+	clone.Env = maps.Clone(p.Env)
+	clone.Metadata = maps.Clone(p.Metadata)
+	clone.ExitCode = clonePointer(p.ExitCode)
+	clone.QueuedAt = clonePointer(p.QueuedAt)
+	clone.StartedAt = clonePointer(p.StartedAt)
+	clone.FinishedAt = clonePointer(p.FinishedAt)
+	clone.RetryAt = clonePointer(p.RetryAt)
+
+	return &clone
+}
+
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+
+	copied := *value
+
+	return &copied
 }

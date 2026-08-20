@@ -16,6 +16,13 @@ import (
 	"github.com/curruwilla/processd/internal/supervisor"
 )
 
+// apiShutdownBudget caps how long the HTTP server waits for its connections.
+//
+// The configured grace period exists for the supervised processes, which may
+// legitimately need tens of seconds; API requests are short, and a client
+// holding an idle keep-alive connection must not delay the daemon by that long.
+const apiShutdownBudget = 5 * time.Second
+
 // Server serves the REST API.
 type Server struct {
 	cfg        config.Config
@@ -87,11 +94,18 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 	case <-ctx.Done():
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(grace, apiShutdownBudget))
 	defer cancel()
 
+	// Graceful first, forced second. A client holding an idle connection open
+	// must not keep the daemon alive past its grace period, and a shutdown that
+	// had to force connections closed is still a successful shutdown.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutting down api: %w", err)
+		s.log.Warn("forcing api shutdown", slog.Any("error", err))
+
+		if closeErr := srv.Close(); closeErr != nil {
+			return fmt.Errorf("closing api: %w", closeErr)
+		}
 	}
 
 	return <-errCh

@@ -8,31 +8,29 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver: keeps CGO_ENABLED=0 builds working
 
-	"github.com/curruwilla/processd/internal/core"
 	"github.com/curruwilla/processd/internal/store"
 )
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// errNotImplemented marks the parts of the skeleton still to be written.
-var errNotImplemented = errors.New("not implemented")
-
 // Store is the SQLite-backed implementation of store.Store.
 type Store struct {
 	db *sql.DB
 
 	// writeMu serialises writes. See the package comment.
-	//nolint:unused // taken by the write methods listed at the bottom of this file
 	writeMu sync.Mutex
 }
 
@@ -114,6 +112,7 @@ func (s *Store) applyMigration(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("starting migration %q: %w", name, err)
 	}
+
 	defer func() {
 		_ = tx.Rollback()
 	}()
@@ -123,7 +122,7 @@ func (s *Store) applyMigration(ctx context.Context, name string) error {
 	}
 
 	insert := `INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)`
-	if _, err := tx.ExecContext(ctx, insert, name, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, insert, name, formatTime(time.Now())); err != nil {
 		return fmt.Errorf("recording migration %q: %w", name, err)
 	}
 
@@ -143,61 +142,83 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// TODO(spec §17): the methods below are the remaining persistence work. Each
-// write must take writeMu; reads must not.
-
-// CreateProcess persists a newly submitted execution.
-func (s *Store) CreateProcess(ctx context.Context, p *core.Process) error {
-	return errNotImplemented
+// formatTime renders a timestamp in the single format the schema stores.
+func formatTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
-// UpdateProcess persists a state change of an execution.
-func (s *Store) UpdateProcess(ctx context.Context, p *core.Process) error {
-	return errNotImplemented
+// formatTimePtr renders an optional timestamp, or NULL.
+func formatTimePtr(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+
+	return formatTime(*t)
 }
 
-// GetProcess returns one execution by its logical ID.
-func (s *Store) GetProcess(ctx context.Context, id string) (*core.Process, error) {
-	return nil, errNotImplemented
+func parseTime(raw string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing timestamp %q: %w", raw, err)
+	}
+
+	return parsed, nil
 }
 
-// ListProcesses returns one cursor-paginated page of executions.
-func (s *Store) ListProcesses(ctx context.Context, f store.Filter) (store.Page, error) {
-	return store.Page{}, errNotImplemented
+func parseTimePtr(raw sql.NullString) (*time.Time, error) {
+	if !raw.Valid || raw.String == "" {
+		return nil, nil
+	}
+
+	parsed, err := parseTime(raw.String)
+	if err != nil {
+		return nil, err
+	}
+
+	return &parsed, nil
 }
 
-// UnfinishedProcesses returns the executions left in a non-terminal state,
-// used by the startup reconciliation pass.
-func (s *Store) UnfinishedProcesses(ctx context.Context) ([]*core.Process, error) {
-	return nil, errNotImplemented
+func encodeJSON(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("encoding column value: %w", err)
+	}
+
+	return string(encoded), nil
 }
 
-// AcquireLock claims a lock key for an execution.
-func (s *Store) AcquireLock(ctx context.Context, key, processID string) error {
-	return errNotImplemented
+func decodeJSON(raw string, out any) error {
+	if raw == "" {
+		return nil
+	}
+
+	if err := json.Unmarshal([]byte(raw), out); err != nil {
+		return fmt.Errorf("decoding column value: %w", err)
+	}
+
+	return nil
 }
 
-// ReleaseLock frees a lock key still held by an execution.
-func (s *Store) ReleaseLock(ctx context.Context, key, processID string) error {
-	return errNotImplemented
+// encodeCursor builds an opaque keyset cursor from the last row of a page.
+func encodeCursor(createdAt time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(formatTime(createdAt) + "|" + id))
 }
 
-// ActiveLocks returns the currently held locks, keyed by lock name.
-func (s *Store) ActiveLocks(ctx context.Context) (map[string]string, error) {
-	return nil, errNotImplemented
-}
+func decodeCursor(cursor string) (time.Time, string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("decoding cursor: %w", err)
+	}
 
-// SaveIdempotency records the outcome of an idempotent request.
-func (s *Store) SaveIdempotency(ctx context.Context, record store.Idempotency) error {
-	return errNotImplemented
-}
+	timestamp, id, found := strings.Cut(string(raw), "|")
+	if !found {
+		return time.Time{}, "", errors.New("malformed cursor")
+	}
 
-// FindIdempotency returns a previously recorded idempotent request.
-func (s *Store) FindIdempotency(ctx context.Context, key string) (store.Idempotency, error) {
-	return store.Idempotency{}, errNotImplemented
-}
+	parsed, err := parseTime(timestamp)
+	if err != nil {
+		return time.Time{}, "", err
+	}
 
-// PurgeHistory removes terminal executions beyond the retention limits.
-func (s *Store) PurgeHistory(ctx context.Context, before time.Time, maxRows int) (int, error) {
-	return 0, errNotImplemented
+	return parsed, id, nil
 }

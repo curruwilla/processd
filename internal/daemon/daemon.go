@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/curruwilla/processd/internal/api"
 	"github.com/curruwilla/processd/internal/config"
@@ -25,6 +26,9 @@ import (
 
 // databaseFile is the SQLite file created inside the configured data dir.
 const databaseFile = "processd.db"
+
+// garbageInterval is how often the retention limits are enforced.
+const garbageInterval = time.Hour
 
 // Daemon is the assembled application.
 type Daemon struct {
@@ -58,6 +62,12 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	sup := supervisor.New(cfg, db, runner.NewExecRunner(), logs, log)
 	scheduler := queue.New(cfg, db, registry, sup, log)
 
+	// The supervisor reads worker policy at attempt time and hands executions
+	// back to the scheduler when an attempt ends.
+	sup.SetWorkers(scheduler.Registry)
+	sup.SetOnFinish(scheduler.OnAttemptFinished)
+	sup.SetOnChange(scheduler.Notify)
+
 	d := &Daemon{
 		cfg:        cfg,
 		log:        log,
@@ -76,6 +86,10 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 		Logger:     log,
 		Reload:     d.Reload,
 	})
+
+	if err := os.MkdirAll(cfg.LogDir, 0o750); err != nil {
+		return nil, fmt.Errorf("creating log dir %q: %w", cfg.LogDir, err)
+	}
 
 	log.Info("workers loaded", slog.Int("count", registry.Len()))
 
@@ -111,6 +125,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	go d.watchReload(ctx)
+	go d.collectGarbage(ctx)
+
+	// Anything left pending by the previous run is dispatched immediately.
+	d.scheduler.Notify()
 
 	var wg sync.WaitGroup
 
@@ -162,4 +180,44 @@ func (d *Daemon) Close() error {
 	}
 
 	return nil
+}
+
+// collectGarbage trims the history and the log directory on a slow tick.
+// Without it, both grow without bound (docs/SPEC.md §10, §17).
+func (d *Daemon) collectGarbage(ctx context.Context) {
+	ticker := time.NewTicker(garbageInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.purgeOnce(ctx)
+		}
+	}
+}
+
+func (d *Daemon) purgeOnce(ctx context.Context) {
+	if retention := d.cfg.History.Retention.Duration(); retention > 0 {
+		removed, err := d.store.PurgeHistory(ctx, time.Now().UTC().Add(-retention), d.cfg.History.MaxRows)
+		if err != nil {
+			d.log.Error("purging history", slog.Any("error", err))
+		}
+
+		if removed > 0 {
+			d.log.Info("purged history", slog.Int("executions", removed))
+		}
+	}
+
+	if retention := d.cfg.Logs.Retention.Duration(); retention > 0 {
+		removed, err := d.logs.Purge(time.Now().Add(-retention))
+		if err != nil {
+			d.log.Error("purging logs", slog.Any("error", err))
+		}
+
+		if removed > 0 {
+			d.log.Info("purged logs", slog.Int("files", removed))
+		}
+	}
 }

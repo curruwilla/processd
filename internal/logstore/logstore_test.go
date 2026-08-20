@@ -2,7 +2,10 @@ package logstore
 
 import (
 	"bytes"
+	"errors"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +30,7 @@ func TestStore_Create(t *testing.T) {
 	store := New(t.TempDir(), 1024)
 	at := time.Now().UTC()
 
-	attempt, err := store.Create("proc_01K", 1, at)
+	attempt, err := store.Create("proc_01K", 1, at, 0)
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -124,4 +127,140 @@ func TestCappedWriter_Write(t *testing.T) {
 			t.Error("output grew after the cap, want it dropped")
 		}
 	})
+}
+
+func TestStore_Lines(t *testing.T) {
+	t.Parallel()
+
+	store := New(t.TempDir(), 1024)
+	at := time.Now().UTC()
+
+	attempt, err := store.Create("proc_1", 1, at, 0)
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	if _, err := attempt.Stdout.Write([]byte("first\nsecond\nthird\n")); err != nil {
+		t.Fatalf("writing stdout: %v", err)
+	}
+
+	if _, err := attempt.Stderr.Write([]byte("boom\n")); err != nil {
+		t.Fatalf("writing stderr: %v", err)
+	}
+
+	if err := attempt.Close(); err != nil {
+		t.Fatalf("Close() returned %v, want nil", err)
+	}
+
+	tests := []struct {
+		name   string
+		stream Stream
+		tail   int
+		want   []string
+	}{
+		{name: "stdout only", stream: StreamStdout, want: []string{"first", "second", "third"}},
+		{name: "stderr only", stream: StreamStderr, want: []string{"boom"}},
+		{
+			name:   "both streams are labelled",
+			stream: StreamBoth,
+			want:   []string{"stdout: first", "stdout: second", "stdout: third", "stderr: boom"},
+		},
+		{name: "tail keeps the last lines", stream: StreamStdout, tail: 2, want: []string{"second", "third"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := store.Lines("proc_1", 1, tt.stream, at, tt.tail)
+			if err != nil {
+				t.Fatalf("Lines() returned %v, want nil", err)
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("Lines() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStore_Lines_missingAttempt(t *testing.T) {
+	t.Parallel()
+
+	lines, err := New(t.TempDir(), 1024).Lines("proc_absent", 1, StreamBoth, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("Lines() returned %v, want nil", err)
+	}
+
+	if len(lines) != 0 {
+		t.Errorf("Lines() = %q, want none", lines)
+	}
+}
+
+func TestStore_Purge(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := New(root, 1024)
+
+	stale := time.Now().Add(-48 * time.Hour)
+
+	staleAttempt, err := store.Create("proc_old", 1, stale, 0)
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	if err := staleAttempt.Close(); err != nil {
+		t.Fatalf("Close() returned %v, want nil", err)
+	}
+
+	// Files are selected by modification time, so the old attempt has to look
+	// old on disk as well as in its path.
+	stalePath := store.Path("proc_old", 1, StreamStdout, stale)
+	if err := os.Chtimes(stalePath, stale, stale); err != nil {
+		t.Fatalf("ageing the log file: %v", err)
+	}
+
+	if err := os.Chtimes(store.Path("proc_old", 1, StreamStderr, stale), stale, stale); err != nil {
+		t.Fatalf("ageing the log file: %v", err)
+	}
+
+	fresh, err := store.Create("proc_new", 1, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	if err := fresh.Close(); err != nil {
+		t.Fatalf("Close() returned %v, want nil", err)
+	}
+
+	removed, err := store.Purge(time.Now().Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatalf("Purge() returned %v, want nil", err)
+	}
+
+	if removed != 2 {
+		t.Errorf("purge removed %d files, want 2", removed)
+	}
+
+	if _, err := os.Stat(stalePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale log still exists, want it purged")
+	}
+
+	if _, err := os.Stat(store.Path("proc_new", 1, StreamStdout, time.Now().UTC())); err != nil {
+		t.Errorf("recent log was purged: %v", err)
+	}
+}
+
+func TestStore_Purge_missingRoot(t *testing.T) {
+	t.Parallel()
+
+	removed, err := New(filepath.Join(t.TempDir(), "absent"), 1024).Purge(time.Now())
+	if err != nil {
+		t.Fatalf("Purge() returned %v, want nil", err)
+	}
+
+	if removed != 0 {
+		t.Errorf("purge removed %d files, want 0", removed)
+	}
 }

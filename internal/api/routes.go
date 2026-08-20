@@ -25,6 +25,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /v1/health", s.health)
 	mux.HandleFunc("GET /v1/stats", s.stats)
+	mux.HandleFunc("GET /v1/metrics", s.metrics)
 
 	return s.recoverPanics(s.logRequests(s.authenticate(mux)))
 }

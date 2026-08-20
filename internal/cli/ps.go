@@ -38,6 +38,10 @@ func newPsCommand() *cobra.Command {
 
 			values.Set("limit", strconv.Itoa(mustInt(cmd, "limit")))
 
+			if cursor := mustString(cmd, "cursor"); cursor != "" {
+				values.Set("cursor", cursor)
+			}
+
 			var page struct {
 				Items      []processRow `json:"items"`
 				NextCursor string       `json:"next_cursor"`
@@ -64,6 +68,7 @@ func newPsCommand() *cobra.Command {
 	cmd.Flags().StringSlice("status", nil, "filter by status, repeatable")
 	cmd.Flags().String("worker", "", "filter by worker name")
 	cmd.Flags().Int("limit", 50, "maximum number of rows")
+	cmd.Flags().String("cursor", "", "continue a previous listing")
 	cmd.Flags().String("output", "table", "output format: table or json")
 
 	return cmd

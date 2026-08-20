@@ -61,10 +61,19 @@ type listResponse struct {
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
-// signalRequest is the body of POST /v1/processes/{id}/signal.
+// logsResponse is the body of GET /v1/processes/{id}/logs.
+type logsResponse struct {
+	Attempt   int      `json:"attempt"`
+	Stream    string   `json:"stream"`
+	Lines     []string `json:"lines"`
+	Truncated bool     `json:"truncated"`
+}
+
+// signalRequest is the body of POST /v1/processes/{id}/signal. There is no
+// per-request choice of target: a signal always reaches the whole process
+// group, otherwise grandchildren would survive it.
 type signalRequest struct {
-	Signal       string `json:"signal"`
-	ProcessGroup *bool  `json:"process_group"`
+	Signal string `json:"signal"`
 }
 
 // workerResponse describes a loaded worker, including the params a client may

@@ -1,0 +1,318 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/curruwilla/processd/internal/config"
+	"github.com/curruwilla/processd/internal/core"
+	"github.com/curruwilla/processd/internal/logstore"
+	"github.com/curruwilla/processd/internal/queue"
+	"github.com/curruwilla/processd/internal/runner"
+	"github.com/curruwilla/processd/internal/store/sqlite"
+	"github.com/curruwilla/processd/internal/supervisor"
+)
+
+const testToken = "test-secret"
+
+const liveWorkers = `
+version: 1
+workers:
+  - name: hello
+    command: /bin/echo
+    args: ["hello", "{{id}}"]
+    params:
+      id: {required: true, pattern: "^[0-9]+$"}
+    cwd: /tmp
+  - name: sleeper
+    command: /bin/sleep
+    args: ["30"]
+    cwd: /tmp
+    kill_grace: 1s
+`
+
+// newLiveServer wires the real object graph: only the network is faked, so the
+// handlers are exercised against actual persistence and process execution.
+func newLiveServer(t *testing.T) http.Handler {
+	t.Helper()
+
+	workersDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workersDir, "w.yaml"), []byte(liveWorkers), 0o600); err != nil {
+		t.Fatalf("writing workers: %v", err)
+	}
+
+	registry, err := config.LoadWorkers(workersDir)
+	if err != nil {
+		t.Fatalf("LoadWorkers() returned %v, want nil", err)
+	}
+
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "processd.db"))
+	if err != nil {
+		t.Fatalf("Open() returned %v, want nil", err)
+	}
+
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	cfg := config.Default()
+	cfg.MaxProcesses = 2
+	cfg.AllowRootProcesses = true
+	cfg.Auth.Tokens = []config.Token{{Name: "test", Hash: HashToken(testToken)}}
+
+	log := slog.New(slog.DiscardHandler)
+	logs := logstore.New(t.TempDir(), 1<<20)
+	sup := supervisor.New(cfg, db, runner.NewExecRunner(), logs, log)
+	scheduler := queue.New(cfg, db, registry, sup, log)
+
+	sup.SetWorkers(scheduler.Registry)
+	sup.SetOnFinish(scheduler.OnAttemptFinished)
+	sup.SetOnChange(scheduler.Notify)
+
+	t.Cleanup(func() {
+		_ = sup.Shutdown(t.Context(), time.Second)
+	})
+
+	return New(Options{
+		Config:     cfg,
+		Store:      db,
+		Scheduler:  scheduler,
+		Supervisor: sup,
+		Logs:       logs,
+		Logger:     log,
+		Reload:     func(context.Context) error { return nil },
+	}).Handler()
+}
+
+func do(t *testing.T, handler http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), method, path, reader)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	return rec
+}
+
+func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
+	t.Helper()
+
+	var out T
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decoding response %q: %v", rec.Body.String(), err)
+	}
+
+	return out
+}
+
+// awaitState polls until the execution reaches a terminal state.
+func awaitState(t *testing.T, handler http.Handler, id string) processResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for time.Now().Before(deadline) {
+		rec := do(t, handler, http.MethodGet, "/v1/processes/"+id, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET process returned %d, want 200", rec.Code)
+		}
+
+		process := decode[processResponse](t, rec)
+		if process.Status.IsTerminal() {
+			return process
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("execution did not reach a terminal state")
+
+	return processResponse{}
+}
+
+func TestServer_createProcess_runsToCompletion(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+
+	rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"42"}}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST returned %d (%s), want 201", rec.Code, rec.Body.String())
+	}
+
+	created := decode[createProcessResponse](t, rec)
+	if created.ID == "" {
+		t.Fatal("response carries no execution id")
+	}
+
+	finished := awaitState(t, handler, created.ID)
+	if finished.Status != core.StateCompleted {
+		t.Fatalf("execution ended as %s, want %s", finished.Status, core.StateCompleted)
+	}
+
+	if finished.ExitCode == nil || *finished.ExitCode != 0 {
+		t.Errorf("exit code = %v, want 0", finished.ExitCode)
+	}
+
+	logs := decode[logsResponse](t, do(t, handler, http.MethodGet, "/v1/processes/"+created.ID+"/logs", "", nil))
+	if len(logs.Lines) != 1 || !strings.Contains(logs.Lines[0], "hello 42") {
+		t.Errorf("logs = %q, want the captured output", logs.Lines)
+	}
+}
+
+func TestServer_createProcess_idempotency(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+	body := `{"worker":"hello","params":{"id":"7"}}`
+	headers := map[string]string{idempotencyHeader: "key-1"}
+
+	first := do(t, handler, http.MethodPost, "/v1/processes", body, headers)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first POST returned %d (%s), want 201", first.Code, first.Body.String())
+	}
+
+	created := decode[createProcessResponse](t, first)
+
+	replay := do(t, handler, http.MethodPost, "/v1/processes", body, headers)
+	if replay.Code != http.StatusOK {
+		t.Fatalf("replay returned %d, want 200", replay.Code)
+	}
+
+	if replay.Header().Get("Idempotent-Replay") != "true" {
+		t.Error("replay is not marked, want the Idempotent-Replay header")
+	}
+
+	if decode[createProcessResponse](t, replay).ID != created.ID {
+		t.Error("replay produced a different execution, want the original one")
+	}
+
+	reuse := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"8"}}`, headers)
+	if reuse.Code != http.StatusConflict {
+		t.Errorf("reusing the key with another payload returned %d, want 409", reuse.Code)
+	}
+}
+
+func TestServer_listProcesses(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+
+	for i := range 3 {
+		body := `{"worker":"hello","params":{"id":"` + string(rune('1'+i)) + `"}}`
+		if rec := do(t, handler, http.MethodPost, "/v1/processes", body, nil); rec.Code != http.StatusCreated {
+			t.Fatalf("POST returned %d (%s), want 201", rec.Code, rec.Body.String())
+		}
+	}
+
+	page := decode[listResponse](t, do(t, handler, http.MethodGet, "/v1/processes?limit=2", "", nil))
+	if len(page.Items) != 2 || page.NextCursor == "" {
+		t.Fatalf("page held %d items with cursor %q, want 2 items and a cursor", len(page.Items), page.NextCursor)
+	}
+
+	next := decode[listResponse](t, do(t, handler, http.MethodGet, "/v1/processes?limit=2&cursor="+page.NextCursor, "", nil))
+	if len(next.Items) != 1 {
+		t.Errorf("second page held %d items, want 1", len(next.Items))
+	}
+
+	if next.Items[0].ID == page.Items[0].ID {
+		t.Error("second page repeats the first")
+	}
+}
+
+func TestServer_deleteProcess(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+
+	rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"sleeper"}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST returned %d (%s), want 201", rec.Code, rec.Body.String())
+	}
+
+	created := decode[createProcessResponse](t, rec)
+
+	deleted := do(t, handler, http.MethodDelete, "/v1/processes/"+created.ID+"?grace=1s", "", nil)
+	if deleted.Code != http.StatusAccepted {
+		t.Fatalf("DELETE returned %d (%s), want 202", deleted.Code, deleted.Body.String())
+	}
+
+	finished := awaitState(t, handler, created.ID)
+	if finished.Status != core.StateCanceled || finished.Reason != core.ReasonUserRequest {
+		t.Errorf("execution is %s/%s, want CANCELED/user_request", finished.Status, finished.Reason)
+	}
+}
+
+func TestServer_metrics(t *testing.T) {
+	t.Parallel()
+
+	rec := do(t, newLiveServer(t), http.MethodGet, "/v1/metrics", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET metrics returned %d, want 200", rec.Code)
+	}
+
+	body := rec.Body.String()
+
+	for _, want := range []string{"processd_daemon_up 1", "processd_slots_max 2", "processd_queue_depth"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics are missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestServer_processLogs_validation(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+
+	rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"1"}}`, nil)
+	created := decode[createProcessResponse](t, rec)
+
+	awaitState(t, handler, created.ID)
+
+	tests := []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "unknown stream", query: "?stream=syslog", want: http.StatusBadRequest},
+		{name: "attempt that never ran", query: "?attempt=9", want: http.StatusBadRequest},
+		{name: "negative tail", query: "?tail=-1", want: http.StatusBadRequest},
+		{name: "explicit stdout", query: "?stream=stdout", want: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := do(t, handler, http.MethodGet, "/v1/processes/"+created.ID+"/logs"+tt.query, "", nil)
+			if got.Code != tt.want {
+				t.Errorf("GET logs%s returned %d, want %d", tt.query, got.Code, tt.want)
+			}
+		})
+	}
+}

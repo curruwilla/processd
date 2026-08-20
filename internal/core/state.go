@@ -28,7 +28,7 @@ var allowedTransitions = map[State][]State{
 	StateQueued:    {StateStarting, StateCanceled, StateFailed},
 	StateStarting:  {StateRunning, StateCrashed},
 	StateRunning:   {StateCompleted, StateCrashed, StateStopping},
-	StateStopping:  {StateCanceled, StateFailed},
+	StateStopping:  {StateCanceled, StateFailed, StateCrashed, StateQueued},
 	StateCrashed:   {StateRetrying, StateFailed},
 	StateRetrying:  {StateStarting, StateQueued, StateCanceled},
 	StateCompleted: {},
