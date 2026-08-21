@@ -27,9 +27,9 @@ processos de verdade — mas ainda não foi usado em produção. Trate a primeir
 
 ## O que não faz
 
-Orquestração de containers, service mesh, consenso distribuído, auto-scaling, provisionamento,
-desired state e réplicas, TLS nativo, tracing OpenTelemetry. Não substitui o systemd para serviços
-de sistema.
+Orquestração de containers, service mesh, consenso distribuído, placement automático entre
+servidores, auto-scaling, provisionamento, desired state e réplicas, TLS nativo, tracing
+OpenTelemetry. Não substitui o systemd para serviços de sistema.
 
 Ele supervisiona processos **no host onde roda**, usando os runtimes, os diretórios de projeto e as
 contas de usuário que já estão lá.
@@ -706,13 +706,23 @@ nada roda como root sem opt-in explícito.
 
 ## Roadmap
 
-| Fase | Entrega |
-|---|---|
-| 1 ✅ | process manager local: API, estados, persistência, auth |
-| 2 ✅ | supervisor: fila, locks, retry/backoff, timeout, recovery |
-| 3 ✅ | observabilidade: métricas, streaming de logs, CPU/memória, console web |
-| 4 ✅ | `type: service`: restart contínuo e rotação de log |
-| 5 | agents e execução distribuída |
+| Fase | Entrega | Precisa de |
+|---|---|---|
+| 1 ✅ | process manager local: API, estados, persistência, auth | — |
+| 2 ✅ | supervisor: fila, locks, retry/backoff, timeout, recovery | — |
+| 3 ✅ | observabilidade: métricas, streaming de logs, CPU/memória, console web | — |
+| 4 ✅ | `type: service`: restart contínuo e rotação de log | — |
+| 5 | trigger agendado: `schedule` no worker, próxima execução visível, política de sobreposição | — |
+| 6 | notificação de falha: webhook ou chamada de worker em falha, crash ou retry esgotado | — |
+| 7 | fleet view: agregação read-only de vários nodes, um console, stream de log por proxy | — |
+| 8 | dispatch remoto explícito: executar no node que o cliente nomear | 7 |
+
+As fases 5 e 6 são locais e independentes entre si, então podem sair em qualquer ordem. A fase 7 lê
+os outros nodes e nunca escreve neles: um hub fora do ar deixa todos os nodes rodando.
+
+**Scheduling distribuído é não-objetivo, não uma fase futura.** Placement automático, least-loaded,
+constraints, réplicas, failover entre nodes e locks distribuídos ficam ao lado do Raft em
+[`docs/SPEC.md`](docs/SPEC.md) §2.2 — uma decisão, não um item de backlog. O raciocínio está na §22.
 
 ---
 

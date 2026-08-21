@@ -27,9 +27,9 @@ processes — but it has not been used in production yet. Treat the first instal
 
 ## What it does not do
 
-Container orchestration, service mesh, distributed consensus, auto-scaling, provisioning, desired
-state and replicas, native TLS, OpenTelemetry tracing. It does not replace systemd for system
-services.
+Container orchestration, service mesh, distributed consensus, automatic placement across servers,
+auto-scaling, provisioning, desired state and replicas, native TLS, OpenTelemetry tracing. It does
+not replace systemd for system services.
 
 It supervises processes **on the host it runs on**, using the runtimes, the project directories and
 the user accounts that are already there.
@@ -704,13 +704,23 @@ process group, and nothing runs as root without an explicit opt-in.
 
 ## Roadmap
 
-| Phase | Delivery |
-|---|---|
-| 1 ✅ | local process manager: API, states, persistence, auth |
-| 2 ✅ | supervisor: queue, locks, retry/backoff, timeout, recovery |
-| 3 ✅ | observability: metrics, log streaming, CPU/memory, web console |
-| 4 ✅ | `type: service`: continuous restart and log rotation |
-| 5 | agents and distributed execution |
+| Phase | Delivery | Needs |
+|---|---|---|
+| 1 ✅ | local process manager: API, states, persistence, auth | — |
+| 2 ✅ | supervisor: queue, locks, retry/backoff, timeout, recovery | — |
+| 3 ✅ | observability: metrics, log streaming, CPU/memory, web console | — |
+| 4 ✅ | `type: service`: continuous restart and log rotation | — |
+| 5 | scheduled triggers: `schedule` on a worker, a visible next run, an overlap policy | — |
+| 6 | failure notifications: a webhook or a worker call on failure, crash or exhausted retries | — |
+| 7 | fleet view: read-only aggregation of several nodes, one console, log streams proxied | — |
+| 8 | explicit remote dispatch: start an execution on a node the client names | 7 |
+
+Phases 5 and 6 are local and independent of each other, so they can land in any order. Phase 7 reads
+other nodes and never writes to them: a hub that is down leaves every node running.
+
+**Distributed scheduling is a non-goal, not a later phase.** Automatic placement, least-loaded,
+constraints, replicas, failover between nodes and distributed locks sit next to Raft in
+[`docs/SPEC.md`](docs/SPEC.md) §2.2 — a decision, not a backlog item. The reasoning is in §22.
 
 ---
 
