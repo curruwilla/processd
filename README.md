@@ -1,5 +1,7 @@
 # Processd
 
+*Também disponível em [português do Brasil](README.pt-BR.md).*
+
 > **Run any CLI process through a simple API and keep it alive.**
 
 Lightweight process manager written in Go. It runs and supervises CLI processes through a REST API:
