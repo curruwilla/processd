@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -187,7 +188,24 @@ func readEvents(body io.Reader, fn func(event, data string) error) error {
 	return nil
 }
 
-// apiFailure turns an error response into the message the API reported.
+// apiError is a failure the daemon reported through the error contract of
+// docs/SPEC.md §6.2. It keeps the machine-readable code, so a command can react
+// to one specific failure instead of matching on message text.
+type apiError struct {
+	code    string
+	message string
+}
+
+func (e *apiError) Error() string { return e.code + ": " + e.message }
+
+// hasCode reports whether err is an API failure carrying the given code.
+func hasCode(err error, code string) bool {
+	var failure *apiError
+
+	return errors.As(err, &failure) && failure.code == code
+}
+
+// apiFailure turns an error response into the failure the API reported.
 func apiFailure(resp *http.Response) error {
 	var body struct {
 		Error struct {
@@ -200,7 +218,7 @@ func apiFailure(resp *http.Response) error {
 		return fmt.Errorf("request failed with status %s", resp.Status)
 	}
 
-	return fmt.Errorf("%s: %s", body.Error.Code, body.Error.Message)
+	return &apiError{code: body.Error.Code, message: body.Error.Message}
 }
 
 // query builds a path with an encoded query string.

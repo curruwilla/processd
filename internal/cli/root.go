@@ -71,6 +71,7 @@ func newRootCommand() *cobra.Command {
 		newPsCommand(),
 		newRunCommand(),
 		newStopCommand(),
+		newRestartCommand(),
 		newSignalCommand(),
 		newLogsCommand(),
 		newWorkersCommand(),

@@ -323,10 +323,13 @@ Métricas em `/v1/metrics`, no formato texto do Prometheus.
 ```bash
 processd reload                  # ou: sudo systemctl kill -s HUP processd
 processd workers                 # confere o que o daemon carregou
+processd restart proc_01KABCDEF...   # aplica a definição nova a uma execução em curso
 ```
 
 Execuções em andamento mantêm a definição com que nasceram: o reload nunca muda um processo que já
-está rodando.
+está rodando. `processd restart` é a saída — para a execução e cria outra a partir do worker
+recarregado, com id novo. Um `service` só volta assim ou por `processd run`: parada deliberada vai
+para `CANCELED` e nunca dispara retry.
 
 ---
 
@@ -345,6 +348,7 @@ gravado por `processd setup` ao lado da config (`/etc/processd/token`).
 | `processd run <worker> [--param nome=valor] [--lock k]` | cria uma execução |
 | `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f]` | saída capturada, com `-f` em streaming |
 | `processd stop <id> [--grace 15s]` | SIGTERM no grupo, SIGKILL depois da graça |
+| `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m]` | para a execução e cria outra a partir do worker, com a definição atual |
 | `processd signal <id> <SINAL>` | envia um sinal do allowlist ao grupo |
 | `processd workers` | workers carregados, com os params declarados |
 | `processd reload` | recarrega `workers.d` |
