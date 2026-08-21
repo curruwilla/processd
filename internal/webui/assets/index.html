@@ -59,6 +59,16 @@
           <p class="metric" id="card-workers">&mdash;</p>
           <p class="hint">definitions loaded</p>
         </article>
+        <article class="card" id="card-services-wrap" hidden>
+          <h2>Services</h2>
+          <p class="metric" id="card-services">&mdash;</p>
+          <p class="hint" id="card-services-hint">up</p>
+        </article>
+        <article class="card" id="card-restarts-wrap" hidden>
+          <h2>Restarts</h2>
+          <p class="metric" id="card-restarts">&mdash;</p>
+          <p class="hint">across the live services</p>
+        </article>
       </div>
 
       <h2 class="section">Active states</h2>
@@ -68,7 +78,7 @@
       <div class="table-wrap">
         <table id="recent">
           <thead>
-            <tr><th>ID</th><th>Worker</th><th>State</th><th>Attempt</th><th>Duration</th><th>Created</th></tr>
+            <tr><th>ID</th><th>Worker</th><th>Type</th><th>State</th><th>Attempt</th><th>Uptime</th><th>Created</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -80,6 +90,13 @@
         <label>State
           <select id="filter-state">
             <option value="">any</option>
+          </select>
+        </label>
+        <label>Type
+          <select id="filter-type">
+            <option value="">any</option>
+            <option value="task">task</option>
+            <option value="service">service</option>
           </select>
         </label>
         <label>Worker
@@ -94,7 +111,7 @@
       <div class="table-wrap">
         <table id="processes">
           <thead>
-            <tr><th>ID</th><th>Worker</th><th>State</th><th>Attempt</th><th>PID</th><th>Duration</th><th>Created</th></tr>
+            <tr><th>ID</th><th>Worker</th><th>Type</th><th>State</th><th>Attempt</th><th>Restarts</th><th>PID</th><th>Uptime</th><th>Created</th></tr>
           </thead>
           <tbody></tbody>
         </table>

@@ -18,6 +18,7 @@ type processRow struct {
 	Status   string `json:"status"`
 	PID      *int   `json:"pid"`
 	Attempt  int    `json:"attempt"`
+	Restarts int    `json:"restarts"`
 	ExitCode *int   `json:"exit_code"`
 }
 
@@ -35,6 +36,10 @@ func newPsCommand() *cobra.Command {
 
 			if worker := mustString(cmd, "worker"); worker != "" {
 				values.Set("worker", worker)
+			}
+
+			if kind := mustString(cmd, "type"); kind != "" {
+				values.Set("type", kind)
 			}
 
 			values.Set("limit", strconv.Itoa(mustInt(cmd, "limit")))
@@ -68,6 +73,7 @@ func newPsCommand() *cobra.Command {
 
 	cmd.Flags().StringSlice("status", nil, "filter by status, repeatable")
 	cmd.Flags().String("worker", "", "filter by worker name")
+	cmd.Flags().String("type", "", "filter by execution type: task or service")
 	cmd.Flags().Int("limit", 50, "maximum number of rows")
 	cmd.Flags().String("cursor", "", "continue a previous listing")
 	cmd.Flags().String("output", "table", "output format: table or json")
@@ -79,16 +85,17 @@ func printProcessTable(cmd *cobra.Command, rows []processRow) {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "ID\tWORKER\tTYPE\tSTATUS\tPID\tATTEMPT\tEXIT")
+	fmt.Fprintln(w, "ID\tWORKER\tTYPE\tSTATUS\tPID\tATTEMPT\tRESTARTS\tEXIT")
 
 	for _, row := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
 			row.ID,
 			row.Worker,
 			row.Type,
 			row.Status,
 			formatOptionalInt(row.PID),
 			row.Attempt,
+			row.Restarts,
 			formatOptionalInt(row.ExitCode),
 		)
 	}

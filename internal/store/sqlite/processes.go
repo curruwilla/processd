@@ -14,7 +14,7 @@ import (
 
 // processColumns is the column list shared by every read query, in the order
 // scanProcess expects.
-const processColumns = `id, worker, type, state, reason, attempt, max_attempts, lock_key,
+const processColumns = `id, worker, type, state, reason, attempt, max_attempts, restarts, lock_key,
 	command, args, env, cwd, run_user, run_group, timeout_ns, metadata,
 	pid, pid_start_time, exit_code, signal, log_truncated,
 	created_at, queued_at, started_at, finished_at, retry_at`
@@ -44,17 +44,17 @@ func (s *Store) CreateProcess(ctx context.Context, p *core.Process) error {
 	}
 
 	const query = `INSERT INTO processes (
-		id, worker, type, state, reason, attempt, max_attempts, lock_key,
+		id, worker, type, state, reason, attempt, max_attempts, restarts, lock_key,
 		command, args, env, cwd, run_user, run_group, timeout_ns, metadata,
 		pid, pid_start_time, exit_code, signal, log_truncated,
 		created_at, queued_at, started_at, finished_at, retry_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	_, err = s.db.ExecContext(ctx, query,
-		p.ID, p.Worker, string(p.Type), string(p.State), string(p.Reason), p.Attempt, p.MaxAttempts, p.Lock,
+		p.ID, p.Worker, string(p.Type), string(p.State), string(p.Reason), p.Attempt, p.MaxAttempts, p.Restarts, p.Lock,
 		p.Command, args, env, p.Cwd, p.User, p.Group, int64(p.Timeout), metadata,
 		//nolint:gosec // a /proc start time is clock ticks since boot, never near the int64 limit
 		p.PID, int64(p.PIDStartTime), p.ExitCode, p.Signal, p.LogTruncated,
@@ -87,7 +87,7 @@ func (s *Store) UpdateProcess(ctx context.Context, p *core.Process) error {
 	}
 
 	const query = `UPDATE processes SET
-		worker = ?, type = ?, state = ?, reason = ?, attempt = ?, max_attempts = ?, lock_key = ?,
+		worker = ?, type = ?, state = ?, reason = ?, attempt = ?, max_attempts = ?, restarts = ?, lock_key = ?,
 		command = ?, args = ?, env = ?, cwd = ?, run_user = ?, run_group = ?, timeout_ns = ?, metadata = ?,
 		pid = ?, pid_start_time = ?, exit_code = ?, signal = ?, log_truncated = ?,
 		queued_at = ?, started_at = ?, finished_at = ?, retry_at = ?
@@ -106,7 +106,7 @@ func (s *Store) UpdateProcess(ctx context.Context, p *core.Process) error {
 	}()
 
 	result, err := tx.ExecContext(ctx, query,
-		p.Worker, string(p.Type), string(p.State), string(p.Reason), p.Attempt, p.MaxAttempts, p.Lock,
+		p.Worker, string(p.Type), string(p.State), string(p.Reason), p.Attempt, p.MaxAttempts, p.Restarts, p.Lock,
 		p.Command, args, env, p.Cwd, p.User, p.Group, int64(p.Timeout), metadata,
 		//nolint:gosec // a /proc start time is clock ticks since boot, never near the int64 limit
 		p.PID, int64(p.PIDStartTime), p.ExitCode, p.Signal, p.LogTruncated,
@@ -191,6 +191,11 @@ func (s *Store) GetProcess(ctx context.Context, id string) (*core.Process, error
 func (s *Store) ListProcesses(ctx context.Context, f store.Filter) (store.Page, error) {
 	where := []string{"1 = 1"}
 	args := []any{}
+
+	if f.Type != "" {
+		where = append(where, "type = ?")
+		args = append(args, string(f.Type))
+	}
 
 	if len(f.States) > 0 {
 		placeholders := make([]string, 0, len(f.States))
@@ -305,6 +310,71 @@ func (s *Store) CountActiveByState(ctx context.Context) (map[core.State]int, err
 		WHERE state NOT IN ` + terminalStates + ` GROUP BY state`
 
 	return s.countStates(ctx, query)
+}
+
+// CountActiveByTypeAndState counts the non-terminal executions of each type.
+//
+// The console needs the split because the same state means different things on
+// each side: a RETRYING task is waiting for a slot, while a RETRYING service is
+// holding one and coming back.
+func (s *Store) CountActiveByTypeAndState(ctx context.Context) (map[core.Type]map[core.State]int, error) {
+	const query = `SELECT type, state, COUNT(*) FROM processes
+		WHERE state NOT IN ` + terminalStates + ` GROUP BY type, state`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("counting active executions per type: %w", err)
+	}
+
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	counts := map[core.Type]map[core.State]int{}
+
+	for rows.Next() {
+		var (
+			procType string
+			state    string
+			count    int
+		)
+
+		if err := rows.Scan(&procType, &state, &count); err != nil {
+			return nil, fmt.Errorf("counting active executions per type: %w", err)
+		}
+
+		byState, ok := counts[core.Type(procType)]
+		if !ok {
+			byState = map[core.State]int{}
+			counts[core.Type(procType)] = byState
+		}
+
+		byState[core.State(state)] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("counting active executions per type: %w", err)
+	}
+
+	return counts, nil
+}
+
+// CountRestarts reports how many restarts the live services have accumulated.
+//
+// It is restricted to the non-terminal rows, so it answers from the type/state
+// index: "how much is this node flapping right now", not a lifetime total that
+// the retained history would keep inflating.
+func (s *Store) CountRestarts(ctx context.Context) (int, error) {
+	const query = `SELECT COALESCE(SUM(restarts), 0) FROM processes
+		WHERE type = ? AND state NOT IN ` + terminalStates
+
+	var total int
+
+	if err := s.db.QueryRowContext(ctx, query, string(core.TypeService)).Scan(&total); err != nil {
+		return 0, fmt.Errorf("counting service restarts: %w", err)
+	}
+
+	return total, nil
 }
 
 // CountPendingByWorker counts the executions waiting for a slot, per worker.
@@ -488,7 +558,7 @@ func scanProcess(row scanner) (*core.Process, error) {
 	)
 
 	err := row.Scan(
-		&p.ID, &p.Worker, &procType, &state, &reason, &p.Attempt, &p.MaxAttempts, &p.Lock,
+		&p.ID, &p.Worker, &procType, &state, &reason, &p.Attempt, &p.MaxAttempts, &p.Restarts, &p.Lock,
 		&p.Command, &rawArgs, &rawEnv, &p.Cwd, &p.User, &p.Group, &timeoutNS, &rawMetadata,
 		&p.PID, &pidStartTime, &exitCode, &p.Signal, &p.LogTruncated,
 		&createdAt, &queuedAt, &startedAt, &finishedAt, &retryAt,

@@ -455,6 +455,7 @@ func (s *Supervisor) settle(
 	s.transition(p, core.StateRetrying, "")
 
 	if p.Type == core.TypeService {
+		p.Restarts++
 		s.metrics.ServiceRestarted(p.Worker)
 	}
 }

@@ -44,6 +44,15 @@ workers:
     args: ["-c", "echo one; sleep 0.4; echo two >&2"]
     cwd: /tmp
     kill_grace: 1s
+  - name: blinker
+    type: service
+    command: /bin/true
+    cwd: /tmp
+    retry:
+      backoff: {type: fixed, initial: 5s, max: 5s, jitter: 0}
+    logs:
+      rotate:
+        max_files: 2
   - name: api
     type: service
     command: /bin/sleep
@@ -473,4 +482,129 @@ func TestServer_createProcess_rawServiceDenied(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("POST returned %d (%s), want 403", rec.Code, rec.Body.String())
 	}
+}
+
+// The console is a client of these fields: without them a service is invisible
+// on a dashboard, because a healthy one produces no terminal state at all.
+func TestServer_serviceObservability(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a running attempt reports uptime instead of nothing", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		created := decode[createProcessResponse](t,
+			do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api"}`, nil))
+
+		process := awaitRunning(t, handler, created.ID)
+
+		if process.DurationMS == nil {
+			t.Fatal("duration_ms is null while the service runs, want its uptime")
+		}
+
+		if process.FinishedAt != nil {
+			t.Error("finished_at is set on a running service, want nil")
+		}
+	})
+
+	t.Run("restarts are counted per execution", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		created := decode[createProcessResponse](t,
+			do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"blinker"}`, nil))
+
+		process := awaitRestart(t, handler, created.ID)
+
+		if process.Restarts < 1 {
+			t.Errorf("restarts = %d, want at least 1", process.Restarts)
+		}
+
+		// A service in backoff has to say when it comes back: a static RETRYING
+		// is not something an operator can act on.
+		if process.RetryAt == nil {
+			t.Error("retry_at is null while the service waits out its backoff")
+		}
+	})
+
+	t.Run("stats separate services from the queue", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		created := decode[createProcessResponse](t,
+			do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"blinker"}`, nil))
+
+		awaitRestart(t, handler, created.ID)
+
+		stats := decode[statsResponse](t, do(t, handler, http.MethodGet, "/v1/stats", "", nil))
+
+		if stats.Services.Restarting < 1 {
+			t.Errorf("services.restarting = %d, want at least 1", stats.Services.Restarting)
+		}
+
+		if stats.Services.Restarts < 1 {
+			t.Errorf("services.restarts = %d, want at least 1", stats.Services.Restarts)
+		}
+
+		// The restarting service holds its slot, so it is not waiting for one.
+		if stats.QueueDepth != 0 {
+			t.Errorf("queue_depth = %d, want 0: a restarting service is not queued", stats.QueueDepth)
+		}
+	})
+
+	t.Run("the listing filters by type", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"1"}}`, nil)
+		do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api"}`, nil)
+
+		services := decode[listResponse](t, do(t, handler, http.MethodGet, "/v1/processes?type=service", "", nil))
+		if len(services.Items) != 1 || services.Items[0].Type != core.TypeService {
+			t.Errorf("type=service returned %d items, want only the service", len(services.Items))
+		}
+
+		tasks := decode[listResponse](t, do(t, handler, http.MethodGet, "/v1/processes?type=task", "", nil))
+		if len(tasks.Items) != 1 || tasks.Items[0].Type != core.TypeTask {
+			t.Errorf("type=task returned %d items, want only the task", len(tasks.Items))
+		}
+
+		rec := do(t, handler, http.MethodGet, "/v1/processes?type=daemon", "", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("type=daemon returned %d, want 400", rec.Code)
+		}
+	})
+}
+
+// awaitRestart polls until the execution is waiting out a backoff.
+func awaitRestart(t *testing.T, handler http.Handler, id string) processResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for time.Now().Before(deadline) {
+		rec := do(t, handler, http.MethodGet, "/v1/processes/"+id, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET process returned %d, want 200", rec.Code)
+		}
+
+		process := decode[processResponse](t, rec)
+		if process.Status == core.StateRetrying {
+			return process
+		}
+
+		if process.Status.IsTerminal() {
+			t.Fatalf("execution reached %s instead of restarting", process.Status)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("execution never reached RETRYING")
+
+	return processResponse{}
 }

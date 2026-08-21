@@ -512,3 +512,80 @@ func TestStore_Ping(t *testing.T) {
 		t.Errorf("Ping() returned %v, want nil", err)
 	}
 }
+
+// The console filters the listing by type and reads the restart counter, so the
+// store has to keep both addressable without scanning the retained history.
+func TestStore_serviceObservability(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	task := newProcess("proc_task", core.StateRunning)
+
+	service := newProcess("proc_service", core.StateRetrying)
+	service.Type = core.TypeService
+	service.Restarts = 7
+
+	for _, p := range []*core.Process{task, service} {
+		if err := db.CreateProcess(ctx, p); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+	}
+
+	t.Run("restarts survive a round trip", func(t *testing.T) {
+		t.Parallel()
+
+		stored, err := db.GetProcess(ctx, "proc_service")
+		if err != nil {
+			t.Fatalf("GetProcess() returned %v, want nil", err)
+		}
+
+		if stored.Restarts != 7 {
+			t.Errorf("restarts = %d, want 7", stored.Restarts)
+		}
+	})
+
+	t.Run("the listing filters by type", func(t *testing.T) {
+		t.Parallel()
+
+		page, err := db.ListProcesses(ctx, store.Filter{Type: core.TypeService})
+		if err != nil {
+			t.Fatalf("ListProcesses() returned %v, want nil", err)
+		}
+
+		if len(page.Items) != 1 || page.Items[0].ID != "proc_service" {
+			t.Errorf("ListProcesses(type=service) returned %d items, want only the service", len(page.Items))
+		}
+	})
+
+	t.Run("counts split by type", func(t *testing.T) {
+		t.Parallel()
+
+		counts, err := db.CountActiveByTypeAndState(ctx)
+		if err != nil {
+			t.Fatalf("CountActiveByTypeAndState() returned %v, want nil", err)
+		}
+
+		if got := counts[core.TypeService][core.StateRetrying]; got != 1 {
+			t.Errorf("service RETRYING = %d, want 1", got)
+		}
+
+		if got := counts[core.TypeTask][core.StateRunning]; got != 1 {
+			t.Errorf("task RUNNING = %d, want 1", got)
+		}
+	})
+
+	t.Run("restarts are summed over the live services", func(t *testing.T) {
+		t.Parallel()
+
+		total, err := db.CountRestarts(ctx)
+		if err != nil {
+			t.Fatalf("CountRestarts() returned %v, want nil", err)
+		}
+
+		if total != 7 {
+			t.Errorf("CountRestarts() = %d, want 7", total)
+		}
+	})
+}

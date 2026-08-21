@@ -14,6 +14,7 @@ import (
 // Filter narrows a process listing. A zero Filter matches everything.
 type Filter struct {
 	States        []core.State
+	Type          core.Type
 	Worker        string
 	Lock          string
 	CreatedAfter  *time.Time
@@ -77,6 +78,16 @@ type Store interface {
 	// state. Restricted to those states, it answers from the state index, so it
 	// can back an endpoint a dashboard polls; CountByState cannot.
 	CountActiveByState(ctx context.Context) (map[core.State]int, error)
+
+	// CountActiveByTypeAndState splits the same counts by execution type. The
+	// console needs the split because a state means different things on each
+	// side: a RETRYING task waits for a slot, a RETRYING service holds one.
+	CountActiveByTypeAndState(ctx context.Context) (map[core.Type]map[core.State]int, error)
+
+	// CountRestarts sums the restarts of the services that are still live. It is
+	// how much the node is flapping now, not a lifetime total the retained
+	// history would keep inflating.
+	CountRestarts(ctx context.Context) (int, error)
 
 	// CountPendingByWorker reports how many executions each worker has waiting
 	// for a slot. Like PendingCount, it is restricted to the two pending states

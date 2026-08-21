@@ -18,7 +18,7 @@ const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
   view: 'overview',
   cursor: '',
-  filters: { state: '', worker: '' },
+  filters: { state: '', type: '', worker: '' },
   selected: null,
   stream: null,
   workers: [],
@@ -109,17 +109,43 @@ function attemptCeiling(item) {
   return item.max_attempts === null ? '\u221e' : item.max_attempts;
 }
 
+// A service in RETRYING is not idle, it is coming back. Saying when turns a
+// static state into something an operator can act on.
+function restartHint(item) {
+  if (item.status !== 'RETRYING' || !item.retry_at) return '';
+
+  const seconds = Math.round((new Date(item.retry_at) - Date.now()) / 1000);
+  return seconds > 0 ? 'restarting in ' + seconds + 's' : 'restarting now';
+}
+
+// duration_ms is elapsed time while an attempt runs, so a healthy service reads
+// as uptime rather than as the blank a never-finishing attempt used to show.
+//
+// Nothing is up while a restart is pending, and duration_ms there is the last
+// attempt's — often a rounded-down 0ms, which reads as a bug and answers
+// nothing. When it comes back is the number worth the column.
+function elapsed(item) {
+  if (item.status === 'RETRYING') return restartHint(item) || '—';
+
+  const rendered = duration(item.duration_ms);
+  return item.finished_at || !item.started_at ? rendered : rendered + ' up';
+}
+
 function processRow(item, columns) {
   const row = document.createElement('tr');
   row.append(cell(short(item.id), 'id'));
   row.append(cell(item.worker || item.command, ''));
+  row.append(cell(item.type, 'kind kind-' + item.type));
 
   const status = cell(item.status, 'state state-' + item.status);
+  const hint = restartHint(item);
+  if (hint) status.title = hint;
   row.append(status);
 
   row.append(cell(item.attempt + '/' + attemptCeiling(item), ''));
+  if (columns.restarts) row.append(cell(item.restarts ? String(item.restarts) : '—', ''));
   if (columns.pid) row.append(cell(item.pid ? String(item.pid) : '—', ''));
-  row.append(cell(duration(item.duration_ms), ''));
+  row.append(cell(elapsed(item), ''));
   row.append(cell(when(item.created_at), ''));
   row.addEventListener('click', () => openDrawer(item.id));
 
@@ -147,6 +173,8 @@ async function loadOverview() {
   el('card-queue').textContent = stats.queue_depth;
   el('card-workers').textContent = stats.workers;
 
+  renderServices(stats.services);
+
   const chips = el('state-chips');
   chips.textContent = '';
   const active = Object.entries(stats.states || {}).filter(([, count]) => count > 0);
@@ -169,7 +197,34 @@ async function loadOverview() {
 
   const body = el('recent').querySelector('tbody');
   body.textContent = '';
-  for (const item of page.items) body.append(processRow(item, { pid: false }));
+  for (const item of page.items) body.append(processRow(item, { pid: false, restarts: false }));
+}
+
+// renderServices shows the two numbers that separate a healthy node from a
+// flapping one. A service produces no terminal state while it is well, so every
+// other counter on this page stays silent however badly it is behaving.
+//
+// The cards stay hidden on a node that runs no services: an operator with only
+// tasks should not have to read past two permanent zeroes.
+function renderServices(services) {
+  const stats = services || { up: 0, restarting: 0, starting: 0, restarts: 0 };
+  const live = stats.up + stats.restarting + stats.starting;
+
+  el('card-services-wrap').hidden = live === 0;
+  el('card-restarts-wrap').hidden = live === 0;
+
+  if (live === 0) return;
+
+  el('card-services').textContent = stats.up + ' / ' + live;
+
+  const pending = [];
+  if (stats.restarting) pending.push(stats.restarting + ' restarting');
+  if (stats.starting) pending.push(stats.starting + ' starting');
+
+  el('card-services-hint').textContent = pending.length ? pending.join(', ') : 'all up';
+
+  el('card-restarts').textContent = stats.restarts;
+  el('card-restarts-wrap').classList.toggle('warn', stats.restarting > 0);
 }
 
 // --------------------------------------------------------------- processes
@@ -177,6 +232,7 @@ async function loadOverview() {
 function processQuery() {
   const params = new URLSearchParams({ limit: '50' });
   if (state.filters.state) params.set('status', state.filters.state);
+  if (state.filters.type) params.set('type', state.filters.type);
   if (state.filters.worker) params.set('worker', state.filters.worker);
   if (state.cursor) params.set('cursor', state.cursor);
   return params.toString();
@@ -189,7 +245,7 @@ async function loadProcesses(append) {
   const body = el('processes').querySelector('tbody');
 
   if (!append) body.textContent = '';
-  for (const item of page.items) body.append(processRow(item, { pid: true }));
+  for (const item of page.items) body.append(processRow(item, { pid: true, restarts: true }));
 
   state.cursor = page.next_cursor || '';
   el('load-more').hidden = !state.cursor;
@@ -304,14 +360,18 @@ async function refreshDrawer() {
   if (!state.selected) return;
 
   const item = await request('processes/' + encodeURIComponent(state.selected));
+  const hintForSub = restartHint(item);
   el('drawer-sub').textContent = item.worker + ' — ' + item.status +
-    (item.reason ? ' (' + item.reason + ')' : '');
+    (item.reason ? ' (' + item.reason + ')' : '') +
+    (hintForSub ? ' — ' + hintForSub : '');
 
   const fields = el('drawer-fields');
   fields.textContent = '';
+  field(fields, 'type', item.type);
   field(fields, 'command', [item.command, ...(item.args || [])].join(' '));
   field(fields, 'cwd', item.cwd);
   field(fields, 'attempt', item.attempt + ' of ' + attemptCeiling(item));
+  if (item.type === 'service') field(fields, 'restarts', item.restarts);
   field(fields, 'pid', item.pid || '—');
   field(fields, 'exit code', item.exit_code === null ? '—' : item.exit_code);
   if (item.signal) field(fields, 'signal', item.signal);
@@ -319,7 +379,10 @@ async function refreshDrawer() {
   field(fields, 'created', when(item.created_at));
   field(fields, 'started', when(item.started_at));
   field(fields, 'finished', when(item.finished_at));
-  field(fields, 'duration', duration(item.duration_ms));
+  field(fields, item.finished_at || !item.started_at ? 'duration' : 'uptime', duration(item.duration_ms));
+
+  const hint = restartHint(item);
+  if (hint) field(fields, 'next restart', hint);
 
   if (item.usage) {
     field(fields, 'cpu', item.usage.cpu_seconds.toFixed(2) + 's');
@@ -554,7 +617,11 @@ function wire() {
 
   el('filters').addEventListener('submit', (event) => {
     event.preventDefault();
-    state.filters = { state: states.value, worker: el('filter-worker').value.trim() };
+    state.filters = {
+      state: states.value,
+      type: el('filter-type').value,
+      worker: el('filter-worker').value.trim(),
+    };
     loadProcesses(false).catch(fail);
   });
 

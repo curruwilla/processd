@@ -28,6 +28,15 @@ func parseFilter(r *http.Request) (store.Filter, error) {
 		Limit:  defaultListLimit,
 	}
 
+	if raw := query.Get("type"); raw != "" {
+		switch core.Type(raw) {
+		case core.TypeTask, core.TypeService:
+			filter.Type = core.Type(raw)
+		default:
+			return store.Filter{}, badRequest("type_unknown", fmt.Sprintf("type %q is unknown", raw))
+		}
+	}
+
 	known := core.States()
 
 	for _, raw := range query["status"] {

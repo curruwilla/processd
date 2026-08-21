@@ -32,7 +32,7 @@ Ainda não foi usado em produção: trate a primeira instalação como piloto.
 | Métricas Prometheus em `/v1/metrics`, com contadores e histograma por worker | pronto |
 | CPU/memória por execução, amostradas de `/proc` | pronto |
 | Streaming de logs por SSE, e `processd logs -f` | pronto |
-| Console web embutido em `/ui/` | pronto |
+| Console web embutido em `/ui/`, com uptime, restarts e filtro por tipo | pronto |
 | CLI completa | pronto |
 
 Fora do escopo, por decisão: desired state e réplicas, execução distribuída (Agents), TLS nativo,
@@ -341,7 +341,7 @@ gravado por `processd setup` ao lado da config (`/etc/processd/token`).
 | `processd setup [--dry-run] [--rotate-token] [--systemd=false] [--start=false]` | instala o node: diretórios, config, token, unit systemd, e imprime tudo |
 | `processd serve --config <path>` | sobe o daemon |
 | `processd status` | saúde, versão, slots, execuções rodando e na fila |
-| `processd ps [--status S] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lista execuções |
+| `processd ps [--status S] [--type task\|service] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lista execuções |
 | `processd run <worker> [--param nome=valor] [--lock k]` | cria uma execução |
 | `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f]` | saída capturada, com `-f` em streaming |
 | `processd stop <id> [--grace 15s]` | SIGTERM no grupo, SIGKILL depois da graça |

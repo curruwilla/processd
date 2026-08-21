@@ -139,6 +139,16 @@ tbody tr { cursor: pointer; }
 tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 td.id { font-family: var(--mono); font-size: 12px; }
 
+/* A card that wants to be noticed without shouting: a node with a service in
+   backoff is not broken, but it is not quiet either. */
+.card.warn { border-color: var(--warn); }
+.card.warn .metric { color: var(--warn); }
+
+/* The execution type is a quiet label, not a status: it never changes, so it
+   should not compete with the state column next to it. */
+.kind { font-size: 12px; color: var(--muted); }
+.kind-service { color: var(--accent); font-weight: 600; }
+
 .state { font-weight: 600; font-size: 12px; }
 .state-RUNNING, .state-STARTING { color: var(--accent); }
 .state-COMPLETED { color: var(--ok); }

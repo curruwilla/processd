@@ -40,6 +40,7 @@ type processResponse struct {
 	PID          *int              `json:"pid"`
 	Attempt      int               `json:"attempt"`
 	MaxAttempts  *int              `json:"max_attempts"`
+	Restarts     int               `json:"restarts"`
 	Command      string            `json:"command"`
 	Args         []string          `json:"args"`
 	Cwd          string            `json:"cwd"`
@@ -54,7 +55,12 @@ type processResponse struct {
 	QueuedAt     *time.Time        `json:"queued_at,omitempty"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"`
 	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
-	DurationMS   *int64            `json:"duration_ms"`
+	RetryAt      *time.Time        `json:"retry_at,omitempty"`
+	// DurationMS is how long the current attempt has been running, and its final
+	// duration once it ended. A running execution reports elapsed time rather
+	// than null: for a service, uptime is the number that matters, and it never
+	// has a finished attempt to report while it is healthy.
+	DurationMS *int64 `json:"duration_ms"`
 }
 
 // usageResponse is what a running execution consumes right now, sampled from
@@ -117,6 +123,22 @@ type statsResponse struct {
 	Running    int            `json:"running"`
 	QueueDepth int            `json:"queue_depth"`
 	States     map[string]int `json:"states"`
+	Services   serviceStats   `json:"services"`
+}
+
+// serviceStats is what the console needs to tell a healthy node from a flapping
+// one. A service produces no terminal state while it is well, so the ordinary
+// counters stay silent about it however badly it is behaving.
+type serviceStats struct {
+	// Up is the services currently running.
+	Up int `json:"up"`
+	// Restarting is the services waiting out a backoff. They still hold their
+	// slots, which is why they are not part of QueueDepth.
+	Restarting int `json:"restarting"`
+	// Starting is the services between the slot and the first byte of output.
+	Starting int `json:"starting"`
+	// Restarts totals the restarts accumulated by the live services.
+	Restarts int `json:"restarts"`
 }
 
 // logLine is one streamed output line, the payload of an SSE "line" event.
@@ -154,6 +176,7 @@ func newProcessResponse(p *core.Process) processResponse {
 		Reason:       p.Reason,
 		Attempt:      p.Attempt,
 		MaxAttempts:  attemptCeiling(p.MaxAttempts),
+		Restarts:     p.Restarts,
 		Command:      p.Command,
 		Args:         p.Args,
 		Cwd:          p.Cwd,
@@ -167,6 +190,7 @@ func newProcessResponse(p *core.Process) processResponse {
 		QueuedAt:     p.QueuedAt,
 		StartedAt:    p.StartedAt,
 		FinishedAt:   p.FinishedAt,
+		RetryAt:      p.RetryAt,
 	}
 
 	if p.PID > 0 {
@@ -174,8 +198,8 @@ func newProcessResponse(p *core.Process) processResponse {
 		resp.PID = &pid
 	}
 
-	if duration := p.Duration(); duration > 0 {
-		ms := duration.Milliseconds()
+	if elapsed := p.Elapsed(time.Now().UTC()); elapsed > 0 {
+		ms := elapsed.Milliseconds()
 		resp.DurationMS = &ms
 	}
 

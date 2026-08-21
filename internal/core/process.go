@@ -49,6 +49,13 @@ type Process struct {
 	Lock     string
 	Metadata map[string]string
 
+	// Restarts counts how many times this execution has come back, for its whole
+	// life. It is deliberately not Attempt: retry.reset_after zeroes the attempt
+	// counter after a healthy run, which is what makes a long-lived service
+	// viable, and would otherwise erase the only evidence that it has been
+	// restarting at all.
+	Restarts int
+
 	// Effective definition, resolved at creation time and frozen afterwards so
 	// that reloading workers.d never mutates a running execution.
 	Command     string
@@ -82,6 +89,25 @@ func (p *Process) Duration() time.Duration {
 	}
 
 	return p.FinishedAt.Sub(*p.StartedAt)
+}
+
+// Elapsed returns how long the current attempt has been running, or its total
+// duration once it has finished.
+//
+// For a task the two are nearly the same question, since an attempt is short by
+// definition. For a service they are not: the attempt that matters is the one
+// still running, and "how long has it been up" is the number an operator reads
+// first.
+func (p *Process) Elapsed(now time.Time) time.Duration {
+	if p.StartedAt == nil {
+		return 0
+	}
+
+	if p.FinishedAt != nil {
+		return p.FinishedAt.Sub(*p.StartedAt)
+	}
+
+	return now.Sub(*p.StartedAt)
 }
 
 // TransitionTo validates the edge against the state machine and applies it.

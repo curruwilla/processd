@@ -61,26 +61,47 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	counts, err := s.store.CountActiveByState(r.Context())
+	byType, err := s.store.CountActiveByTypeAndState(r.Context())
 	if err != nil {
 		writeError(w, s.log, err)
 		return
 	}
 
-	states := make(map[string]int, len(counts))
-	for state, count := range counts {
-		states[string(state)] = count
+	restarts, err := s.store.CountRestarts(r.Context())
+	if err != nil {
+		writeError(w, s.log, err)
+		return
+	}
+
+	tasks := byType[core.TypeTask]
+	services := byType[core.TypeService]
+
+	states := map[string]int{}
+
+	for _, counts := range byType {
+		for state, count := range counts {
+			states[string(state)] += count
+		}
 	}
 
 	used, limit := s.scheduler.Slots().Usage()
 
 	writeJSON(w, s.log, http.StatusOK, statsResponse{
-		SlotsUsed:  used,
-		SlotsMax:   limit,
-		Workers:    s.scheduler.Registry().Len(),
-		Running:    s.supervisor.Running(),
-		QueueDepth: counts[core.StateQueued] + counts[core.StateRetrying],
+		SlotsUsed: used,
+		SlotsMax:  limit,
+		Workers:   s.scheduler.Registry().Len(),
+		Running:   s.supervisor.Running(),
+		// A restarting service already holds its slot, so it is not waiting for
+		// one: counting it as queue depth would report a full queue on a node
+		// whose queue is empty.
+		QueueDepth: states[string(core.StateQueued)] + tasks[core.StateRetrying],
 		States:     states,
+		Services: serviceStats{
+			Up:         services[core.StateRunning],
+			Restarting: services[core.StateRetrying],
+			Starting:   services[core.StateStarting],
+			Restarts:   restarts,
+		},
 	})
 }
 
