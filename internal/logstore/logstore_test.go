@@ -31,7 +31,7 @@ func TestStore_Create(t *testing.T) {
 	store := New(t.TempDir(), 1024)
 	at := time.Now().UTC()
 
-	attempt, err := store.Create("proc_01K", 1, at, 0)
+	attempt, err := store.Create("proc_01K", 1, at, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -60,7 +60,7 @@ func TestStore_Create(t *testing.T) {
 	}
 }
 
-func TestCappedWriter_Write(t *testing.T) {
+func TestStreamWriter_Write(t *testing.T) {
 	t.Parallel()
 
 	t.Run("stores up to the cap and marks truncation", func(t *testing.T) {
@@ -68,7 +68,7 @@ func TestCappedWriter_Write(t *testing.T) {
 
 		var buf bytes.Buffer
 
-		writer := &CappedWriter{w: &buf, limit: 10}
+		writer := &StreamWriter{w: &buf, limit: 10}
 
 		if _, err := writer.Write([]byte("0123456")); err != nil {
 			t.Fatalf("first Write returned %v, want nil", err)
@@ -107,7 +107,7 @@ func TestCappedWriter_Write(t *testing.T) {
 
 		var buf bytes.Buffer
 
-		writer := &CappedWriter{w: &buf, limit: 2}
+		writer := &StreamWriter{w: &buf, limit: 2}
 
 		if _, err := writer.Write([]byte("abcd")); err != nil {
 			t.Fatalf("Write returned %v, want nil", err)
@@ -136,7 +136,7 @@ func TestStore_Lines(t *testing.T) {
 	store := New(t.TempDir(), 1024)
 	at := time.Now().UTC()
 
-	attempt, err := store.Create("proc_1", 1, at, 0)
+	attempt, err := store.Create("proc_1", 1, at, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -206,7 +206,7 @@ func TestStore_Purge(t *testing.T) {
 
 	stale := time.Now().Add(-48 * time.Hour)
 
-	staleAttempt, err := store.Create("proc_old", 1, stale, 0)
+	staleAttempt, err := store.Create("proc_old", 1, stale, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -226,7 +226,7 @@ func TestStore_Purge(t *testing.T) {
 		t.Fatalf("ageing the log file: %v", err)
 	}
 
-	fresh, err := store.Create("proc_new", 1, time.Now().UTC(), 0)
+	fresh, err := store.Create("proc_new", 1, time.Now().UTC(), Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -362,7 +362,7 @@ func TestStore_Lines_tailMatchesFullRead(t *testing.T) {
 	store := New(t.TempDir(), 1<<20)
 	at := time.Now().UTC()
 
-	attempt, err := store.Create("proc_1", 1, at, 0)
+	attempt, err := store.Create("proc_1", 1, at, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}

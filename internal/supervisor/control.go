@@ -54,9 +54,10 @@ func (s *Supervisor) cancelPending(ctx context.Context, id string) error {
 		return err
 	}
 
-	// No slot was held by a queued execution, so only the scheduler's attention
-	// is needed here, not a slot release.
-	s.onChange()
+	// A queued execution holds no slot, but a service stopped during its backoff
+	// does: the slot belongs to the execution, not to one of its attempts. The
+	// release is idempotent, so both cases take the same path.
+	s.onSettle(p)
 
 	return nil
 }

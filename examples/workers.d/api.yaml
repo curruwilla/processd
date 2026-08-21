@@ -1,0 +1,45 @@
+# Example service. A service is not expected to terminate: any exit is abnormal
+# and is followed by a restart, which is the opposite of a task (docs/SPEC.md
+# §4). The restart policy is mostly defaults; only log rotation must be stated.
+version: 1
+workers:
+  - name: api
+    enabled: true
+    type: service
+
+    command: /usr/local/bin/api
+    args:
+      - --listen=127.0.0.1:8080
+
+    cwd: /srv/api
+    user: api
+    group: api
+
+    env:
+      APP_ENV: production
+    env_passthrough: [PATH, LANG, TZ]
+
+    # No timeout: a service has no deadline to exceed. Declaring one is refused.
+    kill_grace: 30s
+
+    max_processes: 1
+
+    retry:
+      # enabled defaults to true and max_attempts to "unlimited" for a service:
+      # an uptime measured in months must not spend an attempt budget.
+      no_retry_exit_codes: [78]   # EX_CONFIG: not worth restarting into forever
+      reset_after: 10m
+      on_shutdown: true           # come back on the next daemon start
+      backoff:
+        type: exponential
+        initial: 1s
+        max: 1m
+        multiplier: 2
+        jitter: 0.2
+
+    # Required for a service: a single attempt can run long enough to fill the
+    # cap, and a stream that stops storing after that is unusable.
+    logs:
+      max_bytes_per_stream: 64MiB
+      rotate:
+        max_files: 5

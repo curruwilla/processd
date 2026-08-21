@@ -63,19 +63,24 @@ func applyJitter(delay time.Duration, jitter float64) time.Duration {
 	return jittered
 }
 
-// Attempts returns how many attempts a worker is allowed to make in total.
+// Attempts returns how many attempts a worker is allowed to make in total, or
+// config.AttemptsUnlimited when the policy sets no ceiling.
 func Attempts(r config.Retry) int {
-	if !r.Enabled {
+	if !r.IsEnabled() {
 		return 1
 	}
 
-	return max(r.MaxAttempts, 1)
+	if r.MaxAttempts.Unlimited() {
+		return config.AttemptsUnlimited
+	}
+
+	return max(r.MaxAttempts.Int(), 1)
 }
 
 // Allowed reports whether another attempt may run after a failure of the given
 // class, taking the attempt counter into account.
 func Allowed(r config.Retry, trigger config.RetryTrigger, attempt int) bool {
-	if !r.Enabled {
+	if !r.IsEnabled() {
 		return false
 	}
 
@@ -83,7 +88,12 @@ func Allowed(r config.Retry, trigger config.RetryTrigger, attempt int) bool {
 		return false
 	}
 
-	return attempt < Attempts(r)
+	ceiling := Attempts(r)
+	if ceiling == config.AttemptsUnlimited {
+		return true
+	}
+
+	return attempt < ceiling
 }
 
 // CounterReset reports whether an attempt ran long enough for the attempt
@@ -95,7 +105,9 @@ func CounterReset(r config.Retry, ran time.Duration) bool {
 	return reset > 0 && ran >= reset
 }
 
-// Succeeded reports whether an exit code counts as success for the worker.
+// Succeeded reports whether an exit code counts as success for the worker. It
+// is only ever asked about a task: no exit of a service is a success, which is
+// why a service may not declare success_exit_codes at all.
 func Succeeded(r config.Retry, exitCode int) bool {
 	codes := r.SuccessExitCodes
 	if len(codes) == 0 {

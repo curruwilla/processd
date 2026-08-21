@@ -96,13 +96,17 @@ func (s *Scheduler) Submit(ctx context.Context, p *core.Process) error {
 		return core.ErrShuttingDown
 	}
 
-	depth, err := s.queueDepth(ctx)
-	if err != nil {
-		return err
-	}
+	// A service never waits in line (docs/SPEC.md §4), so how deep the queue is
+	// says nothing about whether it may start.
+	if p.Type != core.TypeService {
+		depth, err := s.queueDepth(ctx)
+		if err != nil {
+			return err
+		}
 
-	if depth >= s.cfg.Queue.MaxDepth {
-		return fmt.Errorf("queue holds %d executions: %w", depth, core.ErrQueueFull)
+		if depth >= s.cfg.Queue.MaxDepth {
+			return fmt.Errorf("queue holds %d executions: %w", depth, core.ErrQueueFull)
+		}
 	}
 
 	if err := s.store.CreateProcess(ctx, p); err != nil {
@@ -129,21 +133,55 @@ func (s *Scheduler) admit(ctx context.Context, p *core.Process) error {
 		}
 	}
 
-	if !s.slots.TryAcquire(p.Worker) {
-		return s.enqueue(ctx, p)
+	if !s.slots.TryAcquire(p.ID, p.Worker) {
+		return s.park(ctx, p, fmt.Errorf("%d of %d slots in use: %w", used(s.slots), s.cfg.MaxProcesses, core.ErrNoCapacity))
 	}
 
 	if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
-		s.slots.Release(p.Worker)
+		s.slots.Release(p.ID)
 
 		if errors.Is(err, core.ErrLockHeld) {
-			return s.enqueue(ctx, p)
+			return s.park(ctx, p, fmt.Errorf("%q: %w", p.Lock, core.ErrNoCapacity))
 		}
 
 		return err
 	}
 
 	return s.launch(ctx, p)
+}
+
+// park holds a task that could not start yet, and refuses a service that could
+// not start now.
+//
+// A service takes its slot at admission or not at all: parking it would leave
+// something that is supposed to be running listed as merely waiting, with no
+// bound on how long. A task is work to be done eventually, so it queues.
+func (s *Scheduler) park(ctx context.Context, p *core.Process, refusal error) error {
+	if p.Type == core.TypeService {
+		return s.reject(ctx, p, refusal)
+	}
+
+	return s.enqueue(ctx, p)
+}
+
+// reject records an execution that was refused at admission and reports why.
+// The row is kept: an execution that was refused is part of the history.
+func (s *Scheduler) reject(ctx context.Context, p *core.Process, cause error) error {
+	if err := p.TransitionTo(core.StateCanceled, core.ReasonNoCapacity); err != nil {
+		return err
+	}
+
+	if err := s.store.UpdateProcess(ctx, p); err != nil {
+		return err
+	}
+
+	return cause
+}
+
+func used(slots *Slots) int {
+	inUse, _ := slots.Usage()
+
+	return inUse
 }
 
 // rejectLocked records the execution that lost a lock race and reports 409. The
@@ -200,7 +238,7 @@ func (s *Scheduler) launch(ctx context.Context, p *core.Process) error {
 // releaseAll gives back what launch had reserved, so a failure to start never
 // leaks a slot or a lock.
 func (s *Scheduler) releaseAll(ctx context.Context, p *core.Process) {
-	s.slots.Release(p.Worker)
+	s.slots.Release(p.ID)
 
 	if err := s.store.ReleaseLock(ctx, p.Lock, p.ID); err != nil {
 		s.log.Error("releasing lock", slog.String("process", p.ID), slog.Any("error", err))
@@ -250,9 +288,19 @@ func (s *Scheduler) Notify() {
 	}
 }
 
-// OnAttemptFinished frees the slot an attempt held and looks for more work.
-func (s *Scheduler) OnAttemptFinished(p *core.Process) {
-	s.slots.Release(p.Worker)
+// OnExecutionSettled frees the slot an execution held and looks for more work.
+//
+// A service on its way to a restart keeps its slot: it was admitted only
+// because the node had room for it, and letting a task take that room during
+// the backoff would leave the service unable to come back. Every other outcome,
+// including a service stopped mid-backoff, gives the slot back.
+func (s *Scheduler) OnExecutionSettled(p *core.Process) {
+	if p.Type == core.TypeService && p.State == core.StateRetrying {
+		s.Notify()
+		return
+	}
+
+	s.slots.Release(p.ID)
 	s.Notify()
 }
 
@@ -279,12 +327,12 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			continue
 		}
 
-		if !s.slots.TryAcquire(p.Worker) {
+		if !s.slots.TryAcquire(p.ID, p.Worker) {
 			continue
 		}
 
 		if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
-			s.slots.Release(p.Worker)
+			s.slots.Release(p.ID)
 
 			if !errors.Is(err, core.ErrLockHeld) {
 				s.log.Error("acquiring lock", slog.String("process", p.ID), slog.Any("error", err))
@@ -303,6 +351,13 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 func (s *Scheduler) expire(ctx context.Context, p *core.Process) bool {
 	ttl := s.cfg.Queue.ItemTTL.Duration()
 	if ttl <= 0 || p.State != core.StateQueued {
+		return false
+	}
+
+	// A service only passes through the queue on its way back from a daemon
+	// restart it was told to survive; failing it for having waited would undo
+	// exactly what retry.on_shutdown asked for.
+	if p.Type == core.TypeService {
 		return false
 	}
 

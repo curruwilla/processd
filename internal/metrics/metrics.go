@@ -32,6 +32,7 @@ type Registry struct {
 	attempts  map[string]uint64
 	outcomes  map[outcomeKey]uint64
 	durations map[string]*histogram
+	restarts  map[string]uint64
 }
 
 // NewRegistry returns an empty registry.
@@ -40,7 +41,22 @@ func NewRegistry() *Registry {
 		attempts:  map[string]uint64{},
 		outcomes:  map[outcomeKey]uint64{},
 		durations: map[string]*histogram{},
+		restarts:  map[string]uint64{},
 	}
+}
+
+// ServiceRestarted records that a service stopped running and is being started
+// again.
+//
+// A service has no terminal state to count while it is healthy, so the outcome
+// counter says nothing about it. How often it comes back is the signal that
+// matters: a service restarting in a loop looks exactly like a healthy one in
+// every other family.
+func (r *Registry) ServiceRestarted(worker string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.restarts[worker]++
 }
 
 // AttemptStarted records that one attempt of a worker began running.
@@ -98,10 +114,19 @@ func (r *Registry) Write(w *Writer) {
 		durations[worker] = observed.snapshot()
 	}
 
+	restarts := make([]Sample, 0, len(r.restarts))
+	for worker, count := range r.restarts {
+		restarts = append(restarts, Sample{
+			Labels: []Label{{Name: workerLabel, Value: worker}},
+			Value:  float64(count),
+		})
+	}
+
 	r.mu.Unlock()
 
 	w.CounterVec("processd_process_attempts_total", "attempts started per worker", attempts)
 	w.CounterVec("processd_processes_total", "executions finished per worker and terminal state", outcomes)
+	w.CounterVec("processd_service_restarts_total", "service restarts per worker", restarts)
 	writeHistograms(w, "processd_process_duration_seconds", "attempt duration in seconds", durations)
 }
 

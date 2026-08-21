@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -50,6 +51,18 @@ const (
 	filePerm os.FileMode = 0o640
 )
 
+// Policy bounds what one attempt may store.
+//
+// MaxFiles is how many rotated files are kept behind the live one. Zero keeps
+// none and caps the stream instead: what follows the limit is dropped. That
+// suits a task, whose attempt is short by definition, and is unusable for a
+// service, whose single attempt may run for months and would otherwise go
+// silent forever the first time it filled its cap.
+type Policy struct {
+	MaxBytesPerStream int64
+	MaxFiles          int
+}
+
 // Store writes and reads attempt logs under a root directory.
 type Store struct {
 	root     string
@@ -61,7 +74,9 @@ func New(dir string, maxBytes int64) *Store {
 	return &Store{root: dir, maxBytes: maxBytes}
 }
 
-// Path returns the file backing one stream of one attempt.
+// Path returns the file backing one stream of one attempt. The live output of a
+// rotating stream always stays here: rotation moves the older content aside, so
+// a follower has one path to poll rather than a moving target.
 func (s *Store) Path(processID string, attempt int, stream Stream, at time.Time) string {
 	day := at.UTC()
 	name := fmt.Sprintf("%s.%d.%s.log", processID, attempt, stream)
@@ -69,38 +84,41 @@ func (s *Store) Path(processID string, attempt int, stream Stream, at time.Time)
 	return filepath.Join(s.root, day.Format("2006"), day.Format("01"), name)
 }
 
-// Attempt holds the open writers of one attempt.
-type Attempt struct {
-	Stdout *CappedWriter
-	Stderr *CappedWriter
-
-	files []*os.File
+// RotatedPath returns the file holding the generation-th rotation of a stream.
+// Generation 1 is the content moved aside most recently.
+func (s *Store) RotatedPath(processID string, attempt int, stream Stream, at time.Time, generation int) string {
+	return rotatedPath(s.Path(processID, attempt, stream, at), generation)
 }
 
-// Create opens the log files of an attempt. A maxBytes of zero uses the
-// store-wide cap; a worker may lower or raise it for its own executions.
-func (s *Store) Create(processID string, attempt int, at time.Time, maxBytes int64) (*Attempt, error) {
-	limit := maxBytes
-	if limit <= 0 {
-		limit = s.maxBytes
+func rotatedPath(path string, generation int) string {
+	return fmt.Sprintf("%s.%d", path, generation)
+}
+
+// Attempt holds the open writers of one attempt.
+type Attempt struct {
+	Stdout *StreamWriter
+	Stderr *StreamWriter
+}
+
+// Create opens the log files of an attempt. A MaxBytesPerStream of zero uses
+// the store-wide cap; a worker may lower or raise it for its own executions.
+func (s *Store) Create(processID string, attempt int, at time.Time, policy Policy) (*Attempt, error) {
+	if policy.MaxBytesPerStream <= 0 {
+		policy.MaxBytesPerStream = s.maxBytes
 	}
 
-	stdout, stdoutFile, err := s.openStream(processID, attempt, StreamStdout, at, limit)
+	stdout, err := s.openStream(processID, attempt, StreamStdout, at, policy)
 	if err != nil {
 		return nil, err
 	}
 
-	stderr, stderrFile, err := s.openStream(processID, attempt, StreamStderr, at, limit)
+	stderr, err := s.openStream(processID, attempt, StreamStderr, at, policy)
 	if err != nil {
-		_ = stdoutFile.Close()
+		_ = stdout.Close()
 		return nil, err
 	}
 
-	return &Attempt{
-		Stdout: stdout,
-		Stderr: stderr,
-		files:  []*os.File{stdoutFile, stderrFile},
-	}, nil
+	return &Attempt{Stdout: stdout, Stderr: stderr}, nil
 }
 
 func (s *Store) openStream(
@@ -108,36 +126,54 @@ func (s *Store) openStream(
 	attempt int,
 	stream Stream,
 	at time.Time,
-	limit int64,
-) (*CappedWriter, *os.File, error) {
+	policy Policy,
+) (*StreamWriter, error) {
 	path := s.Path(processID, attempt, stream, at)
 
 	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
-		return nil, nil, fmt.Errorf("creating log dir for %s: %w", processID, err)
+		return nil, fmt.Errorf("creating log dir for %s: %w", processID, err)
 	}
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm) //nolint:gosec // the path is derived from the configured log dir
+	file, err := createLogFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("creating log file %q: %w", path, err)
+		return nil, err
 	}
 
-	return &CappedWriter{w: file, limit: limit}, file, nil
+	writer := &StreamWriter{w: file, limit: policy.MaxBytesPerStream, closer: file}
+
+	if policy.MaxFiles > 0 {
+		rotating := &rotator{path: path, maxFiles: policy.MaxFiles, current: file}
+		writer.rotate = rotating.next
+		writer.closer = rotating
+	}
+
+	return writer, nil
 }
 
-// Truncated reports whether either stream hit the size cap.
+func createLogFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm) //nolint:gosec // the path is derived from the configured log dir
+	if err != nil {
+		return nil, fmt.Errorf("creating log file %q: %w", path, err)
+	}
+
+	return file, nil
+}
+
+// Truncated reports whether either stream lost output, by hitting the size cap
+// or by rotating past the files it is allowed to keep.
 func (a *Attempt) Truncated() bool {
 	return a.Stdout.Truncated() || a.Stderr.Truncated()
 }
 
 // Close flushes and closes the underlying files.
 func (a *Attempt) Close() error {
-	for _, file := range a.files {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("closing log file: %w", err)
-		}
+	err := a.Stdout.Close()
+
+	if stderrErr := a.Stderr.Close(); err == nil {
+		err = stderrErr
 	}
 
-	return nil
+	return err
 }
 
 // File is an open log file. It adds the size lookup the backwards tail walk
@@ -156,10 +192,12 @@ func (f File) Size() (int64, error) {
 	return info.Size(), nil
 }
 
-// Open returns a reader over one stream of one attempt.
+// Open returns a reader over the live file of one stream of one attempt.
 func (s *Store) Open(processID string, attempt int, stream Stream, at time.Time) (File, error) {
-	path := s.Path(processID, attempt, stream, at)
+	return openFile(s.Path(processID, attempt, stream, at))
+}
 
+func openFile(path string) (File, error) {
 	file, err := os.Open(path) //nolint:gosec // the path is derived from the configured log dir
 	if err != nil {
 		return File{}, fmt.Errorf("opening log file %q: %w", path, err)
@@ -168,46 +206,81 @@ func (s *Store) Open(processID string, attempt int, stream Stream, at time.Time)
 	return File{File: file}, nil
 }
 
-// CappedWriter writes until a byte limit is reached, then drops the rest.
+// StreamWriter bounds what one stream of one attempt may store.
 //
 // A process that logs in a loop would otherwise fill the disk, which is a
-// trivial denial of service against every other worker on the node.
-type CappedWriter struct {
+// trivial denial of service against every other worker on the node. Two bounded
+// behaviours are available at the limit: dropping the rest, and rotating.
+type StreamWriter struct {
 	w       io.Writer
 	limit   int64
 	written int64
+	stored  int64
 	capped  bool
+	dropped bool
+
+	// rotate installs the next file once the current one is full, reporting
+	// whether an older one had to be discarded to make room. A nil rotate caps
+	// the stream instead.
+	rotate func() (io.Writer, bool, error)
+	closer io.Closer
 }
 
-// Write implements io.Writer. It never reports short writes to the process:
-// the child must not receive an I/O error because the daemon stopped storing.
-func (c *CappedWriter) Write(p []byte) (int, error) {
-	if c.capped {
-		return len(p), nil
+// Write implements io.Writer. It never reports short writes to the process: the
+// child must not receive an I/O error because the daemon stopped storing.
+func (c *StreamWriter) Write(p []byte) (int, error) {
+	total := len(p)
+
+	for len(p) > 0 {
+		if c.capped {
+			return total, nil
+		}
+
+		remaining := c.limit - c.written
+		if remaining <= 0 {
+			if err := c.roll(); err != nil {
+				return total, err
+			}
+
+			continue
+		}
+
+		size := min(int64(len(p)), remaining)
+
+		if _, err := c.w.Write(p[:size]); err != nil {
+			return 0, err
+		}
+
+		c.written += size
+		c.stored += size
+		p = p[size:]
 	}
 
-	remaining := c.limit - c.written
-	if remaining <= 0 {
-		return len(p), c.markCapped()
-	}
-
-	if int64(len(p)) <= remaining {
-		n, err := c.w.Write(p)
-		c.written += int64(n)
-
-		return n, err
-	}
-
-	if _, err := c.w.Write(p[:remaining]); err != nil {
-		return 0, err
-	}
-
-	c.written = c.limit
-
-	return len(p), c.markCapped()
+	return total, nil
 }
 
-func (c *CappedWriter) markCapped() error {
+// roll makes room for more output, either by moving the full file aside or, for
+// a stream that does not rotate, by giving up on the rest.
+func (c *StreamWriter) roll() error {
+	// A non-positive limit can never be rolled out of, so it must cap: rotating
+	// a file that is full the moment it is opened would loop forever.
+	if c.rotate == nil || c.limit <= 0 {
+		return c.markCapped()
+	}
+
+	next, dropped, err := c.rotate()
+	if err != nil {
+		return err
+	}
+
+	c.w = next
+	c.written = 0
+	c.dropped = c.dropped || dropped
+
+	return nil
+}
+
+func (c *StreamWriter) markCapped() error {
 	c.capped = true
 
 	if _, err := fmt.Fprintf(c.w, "\n[processd] output truncated at %d bytes\n", c.limit); err != nil {
@@ -217,18 +290,95 @@ func (c *CappedWriter) markCapped() error {
 	return nil
 }
 
-// Truncated reports whether the cap was reached.
-func (c *CappedWriter) Truncated() bool { return c.capped }
+// Truncated reports whether output was lost, either at the cap or by rotating
+// past the files the stream is allowed to keep.
+func (c *StreamWriter) Truncated() bool { return c.capped || c.dropped }
 
 // Written returns how many bytes of process output were stored.
-func (c *CappedWriter) Written() int64 { return c.written }
+func (c *StreamWriter) Written() int64 { return c.stored }
+
+// Close releases the file the stream is writing to.
+func (c *StreamWriter) Close() error {
+	if c.closer == nil {
+		return nil
+	}
+
+	if err := c.closer.Close(); err != nil {
+		return fmt.Errorf("closing log file: %w", err)
+	}
+
+	return nil
+}
+
+// rotator moves the live file aside once it is full and opens a fresh one in
+// its place, keeping at most maxFiles generations behind it.
+type rotator struct {
+	path     string
+	maxFiles int
+	current  *os.File
+}
+
+// next retires the current file and returns the one that replaces it, reporting
+// whether the oldest generation had to be discarded to make room.
+func (r *rotator) next() (io.Writer, bool, error) {
+	if err := r.current.Close(); err != nil {
+		return nil, false, fmt.Errorf("closing log file %q: %w", r.path, err)
+	}
+
+	dropped, err := r.shift()
+	if err != nil {
+		return nil, dropped, err
+	}
+
+	file, err := createLogFile(r.path)
+	if err != nil {
+		return nil, dropped, err
+	}
+
+	r.current = file
+
+	return file, dropped, nil
+}
+
+// shift renames each kept generation one step older, discards what falls past
+// maxFiles and moves the live file into generation 1.
+func (r *rotator) shift() (bool, error) {
+	dropped := false
+
+	err := os.Remove(rotatedPath(r.path, r.maxFiles))
+
+	switch {
+	case err == nil:
+		dropped = true
+	case !errors.Is(err, os.ErrNotExist):
+		return false, fmt.Errorf("discarding oldest log of %q: %w", r.path, err)
+	}
+
+	for generation := r.maxFiles - 1; generation >= 1; generation-- {
+		from := rotatedPath(r.path, generation)
+		to := rotatedPath(r.path, generation+1)
+
+		if err := os.Rename(from, to); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return dropped, fmt.Errorf("rotating log %q: %w", from, err)
+		}
+	}
+
+	if err := os.Rename(r.path, rotatedPath(r.path, 1)); err != nil {
+		return dropped, fmt.Errorf("rotating log %q: %w", r.path, err)
+	}
+
+	return dropped, nil
+}
+
+// Close releases whichever file the rotator is currently writing to.
+func (r *rotator) Close() error { return r.current.Close() }
 
 // Lines reads the captured output of one attempt.
 //
-// A tail of zero returns everything stored. Reading "both" interleaves the two
-// files in file order and marks the origin of each line, which is the closest
-// approximation available: the streams are captured separately and lines carry
-// no timestamps.
+// A tail of zero returns everything stored, oldest rotation first. Reading
+// "both" interleaves the two files in file order and marks the origin of each
+// line, which is the closest approximation available: the streams are captured
+// separately and lines carry no timestamps.
 func (s *Store) Lines(processID string, attempt int, stream Stream, at time.Time, tail int) ([]string, error) {
 	streams := []Stream{stream}
 	labelled := false
@@ -262,8 +412,53 @@ func (s *Store) Lines(processID string, attempt int, stream Stream, at time.Time
 	return lines, nil
 }
 
+// readLines reads one stream across its rotations, oldest first, stopping as
+// soon as a bounded tail has been satisfied.
 func (s *Store) readLines(processID string, attempt int, stream Stream, at time.Time, tail int) ([]string, error) {
-	file, err := s.Open(processID, attempt, stream, at)
+	paths := s.streamFiles(processID, attempt, stream, at)
+	lines := []string{}
+
+	// A bounded tail walks the generations from the newest backwards and stops
+	// as soon as it has enough, so rotations older than the request are never
+	// opened at all.
+	for _, path := range slices.Backward(paths) {
+		read, err := readFileLines(path, tail)
+		if err != nil {
+			return nil, fmt.Errorf("reading log of %s attempt %d: %w", processID, attempt, err)
+		}
+
+		lines = append(read, lines...)
+
+		if tail > 0 && len(lines) >= tail {
+			return lines[len(lines)-tail:], nil
+		}
+	}
+
+	return lines, nil
+}
+
+// streamFiles returns the files holding one stream, oldest rotation first and
+// the live file last.
+func (s *Store) streamFiles(processID string, attempt int, stream Stream, at time.Time) []string {
+	live := s.Path(processID, attempt, stream, at)
+
+	rotations := []string{}
+
+	for generation := 1; ; generation++ {
+		path := rotatedPath(live, generation)
+		if _, err := os.Stat(path); err != nil {
+			break
+		}
+
+		// Generation 1 is the newest, so prepending keeps the walk chronological.
+		rotations = append([]string{path}, rotations...)
+	}
+
+	return append(rotations, live)
+}
+
+func readFileLines(path string, tail int) ([]string, error) {
+	file, err := openFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -277,12 +472,7 @@ func (s *Store) readLines(processID string, attempt int, stream Stream, at time.
 	}()
 
 	if tail > 0 {
-		lines, err := tailLines(file, tail)
-		if err != nil {
-			return nil, fmt.Errorf("reading log of %s attempt %d: %w", processID, attempt, err)
-		}
-
-		return lines, nil
+		return tailLines(file, tail)
 	}
 
 	lines := []string{}
@@ -294,7 +484,7 @@ func (s *Store) readLines(processID string, attempt int, stream Stream, at time.
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading log of %s attempt %d: %w", processID, attempt, err)
+		return nil, err
 	}
 
 	return lines, nil

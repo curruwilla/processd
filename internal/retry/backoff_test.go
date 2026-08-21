@@ -80,7 +80,7 @@ func TestAllowed(t *testing.T) {
 	t.Parallel()
 
 	policy := config.Retry{
-		Enabled:     true,
+		Enabled:     config.Bool(true),
 		MaxAttempts: 3,
 		RetryOn:     []config.RetryTrigger{config.RetryOnNonZeroExit, config.RetryOnSignal},
 	}
@@ -191,5 +191,52 @@ func TestCounterReset(t *testing.T) {
 
 	if CounterReset(config.Retry{}, time.Hour) {
 		t.Error("CounterReset without reset_after = true, want false")
+	}
+}
+
+// A service is meant to run forever, so its policy has no attempt budget to
+// exhaust: an uptime measured in months must not retire it (docs/SPEC.md §12).
+func TestAllowed_Unlimited(t *testing.T) {
+	t.Parallel()
+
+	policy := config.Retry{
+		Enabled:     config.Bool(true),
+		MaxAttempts: config.AttemptsUnlimited,
+		RetryOn:     []config.RetryTrigger{config.RetryOnExit},
+	}
+
+	if got := Attempts(policy); got != config.AttemptsUnlimited {
+		t.Errorf("Attempts() = %d, want %d", got, config.AttemptsUnlimited)
+	}
+
+	for _, attempt := range []int{1, 2, 10_000} {
+		if !Allowed(policy, config.RetryOnExit, attempt) {
+			t.Errorf("Allowed(attempt %d) = false, want true", attempt)
+		}
+	}
+
+	// An unlimited ceiling is not a licence to retry a class the policy never
+	// opted into.
+	if Allowed(policy, config.RetryOnTimeout, 1) {
+		t.Error("Allowed(timeout) = true, want false for a trigger outside retry_on")
+	}
+}
+
+// A task keeps a bounded budget even though the unlimited sentinel now exists.
+func TestAllowed_TaskCeilingUnchanged(t *testing.T) {
+	t.Parallel()
+
+	policy := config.Retry{
+		Enabled:     config.Bool(true),
+		MaxAttempts: 2,
+		RetryOn:     []config.RetryTrigger{config.RetryOnNonZeroExit},
+	}
+
+	if !Allowed(policy, config.RetryOnNonZeroExit, 1) {
+		t.Error("Allowed(attempt 1) = false, want true")
+	}
+
+	if Allowed(policy, config.RetryOnNonZeroExit, 2) {
+		t.Error("Allowed(attempt 2) = true, want false at the ceiling")
 	}
 }

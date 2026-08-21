@@ -3,8 +3,12 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/curruwilla/processd/internal/core"
 )
 
 func TestWorker_Validate(t *testing.T) {
@@ -52,19 +56,34 @@ func TestWorker_Validate(t *testing.T) {
 			wantErr: "pattern",
 		},
 		{
-			name:    "service type is not supported yet",
-			mutate:  func(w *Worker) { w.Type = "service" },
+			name:    "unknown type is refused",
+			mutate:  func(w *Worker) { w.Type = "daemon" },
 			wantErr: "not supported",
 		},
 		{
 			name: "retry jitter must be a ratio",
 			mutate: func(w *Worker) {
-				w.Retry.Enabled = true
+				w.Retry.Enabled = Bool(true)
 				w.Retry.MaxAttempts = 2
 				w.Retry.Backoff.Type = BackoffFixed
 				w.Retry.Backoff.Jitter = 3
 			},
 			wantErr: "jitter",
+		},
+		{
+			name:    "a task may not retry on a plain exit",
+			mutate:  func(w *Worker) { w.Retry.RetryOn = []RetryTrigger{RetryOnExit} },
+			wantErr: "only valid for a service",
+		},
+		{
+			name:    "a task may not retry forever",
+			mutate:  func(w *Worker) { w.Retry.MaxAttempts = AttemptsUnlimited },
+			wantErr: "only valid for a service",
+		},
+		{
+			name:    "rotation depth may not be negative",
+			mutate:  func(w *Worker) { w.Logs.Rotate.MaxFiles = -1 },
+			wantErr: "must not be negative",
 		},
 	}
 
@@ -192,4 +211,136 @@ func writeWorkerFile(t *testing.T, name, content string) string {
 	}
 
 	return dir
+}
+
+// TestWorker_ValidateService covers the keys whose meaning flips between the
+// two execution types, where the wrong one has to be refused rather than
+// quietly ignored (docs/SPEC.md §4).
+func TestWorker_ValidateService(t *testing.T) {
+	t.Parallel()
+
+	valid := func() *Worker {
+		w := &Worker{
+			Name:    "api",
+			Type:    core.TypeService,
+			Command: "/usr/bin/api",
+			Logs:    WorkerLogs{Rotate: LogRotate{MaxFiles: 3}},
+		}
+		applyWorkerDefaults(w)
+
+		return w
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Worker)
+		wantErr string
+	}{
+		{
+			name:   "valid service",
+			mutate: func(*Worker) {},
+		},
+		{
+			name:    "retries may not be turned off",
+			mutate:  func(w *Worker) { w.Retry.Enabled = Bool(false) },
+			wantErr: "must not be false for a service",
+		},
+		{
+			name:    "a service has no timeout",
+			mutate:  func(w *Worker) { w.Timeout = Duration(time.Minute) },
+			wantErr: "no deadline",
+		},
+		{
+			name:    "no exit code counts as success",
+			mutate:  func(w *Worker) { w.Retry.SuccessExitCodes = []int{0} },
+			wantErr: "every exit is abnormal",
+		},
+		{
+			name:    "logs must rotate",
+			mutate:  func(w *Worker) { w.Logs.Rotate.MaxFiles = 0 },
+			wantErr: "logs.rotate.max_files",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			worker := valid()
+			tt.mutate(worker)
+
+			err := worker.Validate()
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() returned %v, want nil", err)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("Validate() returned nil, want an error mentioning %q", tt.wantErr)
+			}
+
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestApplyWorkerDefaults_Service pins the defaults a service gets for free.
+// They are what makes a service definition short: nothing in this list has a
+// second sensible answer.
+func TestApplyWorkerDefaults_Service(t *testing.T) {
+	t.Parallel()
+
+	worker := &Worker{
+		Name:    "api",
+		Type:    core.TypeService,
+		Command: "/usr/bin/api",
+		Logs:    WorkerLogs{Rotate: LogRotate{MaxFiles: 3}},
+	}
+	applyWorkerDefaults(worker)
+
+	if !worker.Retry.IsEnabled() {
+		t.Error("retry.enabled = false, want a service to restart by default")
+	}
+
+	if !worker.Retry.MaxAttempts.Unlimited() {
+		t.Errorf("retry.max_attempts = %v, want unlimited", worker.Retry.MaxAttempts)
+	}
+
+	if !slices.Contains(worker.Retry.RetryOn, RetryOnExit) {
+		t.Errorf("retry.retry_on = %v, want it to include %q", worker.Retry.RetryOn, RetryOnExit)
+	}
+
+	if len(worker.Retry.SuccessExitCodes) != 0 {
+		t.Errorf("retry.success_exit_codes = %v, want none for a service", worker.Retry.SuccessExitCodes)
+	}
+
+	if err := worker.Validate(); err != nil {
+		t.Errorf("Validate() returned %v, want the defaults to be valid", err)
+	}
+}
+
+// A task keeps the defaults it had before services existed.
+func TestApplyWorkerDefaults_TaskUnchanged(t *testing.T) {
+	t.Parallel()
+
+	worker := &Worker{Name: "invoice", Command: "/bin/echo", Retry: Retry{Enabled: Bool(true)}}
+	applyWorkerDefaults(worker)
+
+	if worker.Retry.MaxAttempts != 1 {
+		t.Errorf("retry.max_attempts = %v, want 1", worker.Retry.MaxAttempts)
+	}
+
+	if slices.Contains(worker.Retry.RetryOn, RetryOnExit) {
+		t.Errorf("retry.retry_on = %v, want no %q for a task", worker.Retry.RetryOn, RetryOnExit)
+	}
+
+	if !slices.Equal(worker.Retry.SuccessExitCodes, []int{0}) {
+		t.Errorf("retry.success_exit_codes = %v, want [0]", worker.Retry.SuccessExitCodes)
+	}
 }

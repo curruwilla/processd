@@ -12,6 +12,7 @@ var (
 	ErrWorkerDisabled   = errors.New("worker is disabled")
 	ErrLockHeld         = errors.New("lock is held by another execution")
 	ErrQueueFull        = errors.New("queue is full")
+	ErrNoCapacity       = errors.New("no free slot for a service")
 	ErrShuttingDown     = errors.New("daemon is shutting down")
 	ErrUnsupportedType  = errors.New("execution type is not supported")
 	ErrRawCommandDenied = errors.New("raw command execution is disabled")

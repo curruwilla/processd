@@ -35,6 +35,27 @@ func badRequest(code, message string) *apiError {
 	return &apiError{Status: http.StatusBadRequest, Code: code, Message: message}
 }
 
+// sentinelStatus places each domain sentinel in the HTTP contract. It is a
+// table rather than a switch so that adding a failure mode is one line and the
+// whole contract stays readable at a glance (docs/SPEC.md §6.2).
+var sentinelStatus = []struct {
+	err    error
+	status int
+	code   string
+}{
+	{core.ErrNotFound, http.StatusNotFound, "not_found"},
+	{core.ErrWorkerNotFound, http.StatusNotFound, "worker_not_found"},
+	{core.ErrWorkerDisabled, http.StatusUnprocessableEntity, "worker_disabled"},
+	{core.ErrLockHeld, http.StatusConflict, "lock_held"},
+	{core.ErrIdempotencyReuse, http.StatusConflict, "idempotency_reuse"},
+	{core.ErrNotRunning, http.StatusConflict, "not_running"},
+	{core.ErrQueueFull, http.StatusTooManyRequests, "queue_full"},
+	{core.ErrShuttingDown, http.StatusServiceUnavailable, "shutting_down"},
+	{core.ErrNoCapacity, http.StatusServiceUnavailable, "no_capacity"},
+	{core.ErrUnsupportedType, http.StatusBadRequest, "unsupported_type"},
+	{core.ErrRawCommandDenied, http.StatusForbidden, "raw_command_denied"},
+}
+
 // statusFor maps domain errors to the HTTP contract. Anything unmapped is a
 // server error: an unexpected error must never be reported as a client mistake.
 func statusFor(err error) *apiError {
@@ -53,33 +74,16 @@ func statusFor(err error) *apiError {
 		}
 	}
 
-	switch {
-	case errors.Is(err, core.ErrNotFound):
-		return &apiError{Status: http.StatusNotFound, Code: "not_found", Message: err.Error()}
-	case errors.Is(err, core.ErrWorkerNotFound):
-		return &apiError{Status: http.StatusNotFound, Code: "worker_not_found", Message: err.Error()}
-	case errors.Is(err, core.ErrWorkerDisabled):
-		return &apiError{Status: http.StatusUnprocessableEntity, Code: "worker_disabled", Message: err.Error()}
-	case errors.Is(err, core.ErrLockHeld):
-		return &apiError{Status: http.StatusConflict, Code: "lock_held", Message: err.Error()}
-	case errors.Is(err, core.ErrIdempotencyReuse):
-		return &apiError{Status: http.StatusConflict, Code: "idempotency_reuse", Message: err.Error()}
-	case errors.Is(err, core.ErrNotRunning):
-		return &apiError{Status: http.StatusConflict, Code: "not_running", Message: err.Error()}
-	case errors.Is(err, core.ErrQueueFull):
-		return &apiError{Status: http.StatusTooManyRequests, Code: "queue_full", Message: err.Error()}
-	case errors.Is(err, core.ErrShuttingDown):
-		return &apiError{Status: http.StatusServiceUnavailable, Code: "shutting_down", Message: err.Error()}
-	case errors.Is(err, core.ErrUnsupportedType):
-		return &apiError{Status: http.StatusBadRequest, Code: "unsupported_type", Message: err.Error()}
-	case errors.Is(err, core.ErrRawCommandDenied):
-		return &apiError{Status: http.StatusForbidden, Code: "raw_command_denied", Message: err.Error()}
-	default:
-		return &apiError{
-			Status:  http.StatusInternalServerError,
-			Code:    "internal_error",
-			Message: "internal error",
+	for _, mapped := range sentinelStatus {
+		if errors.Is(err, mapped.err) {
+			return &apiError{Status: mapped.status, Code: mapped.code, Message: err.Error()}
 		}
+	}
+
+	return &apiError{
+		Status:  http.StatusInternalServerError,
+		Code:    "internal_error",
+		Message: "internal error",
 	}
 }
 

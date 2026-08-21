@@ -96,7 +96,10 @@ func (s *Supervisor) recoverInterrupted(ctx context.Context, p *core.Process) er
 		return err
 	}
 
-	s.settle(ctx, p, worker, config.RetryOnNonZeroExit, core.ReasonDaemonRestart)
+	// The exit code of a process this daemon never waited on is unrecoverable, so
+	// the restart is classified as the plain "it stopped running" trigger of its
+	// type: a service narrowed to retry_on: [exit] must still come back.
+	s.settle(ctx, p, worker, exitTrigger(p.Type, runner.Result{}), core.ReasonDaemonRestart)
 
 	return s.store.UpdateProcess(ctx, p)
 }

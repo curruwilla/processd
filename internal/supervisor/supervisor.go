@@ -52,6 +52,7 @@ func (e *execution) setIntent(reason core.Reason) bool {
 type Metrics interface {
 	AttemptStarted(worker string)
 	AttemptFinished(worker, state string, elapsed time.Duration)
+	ServiceRestarted(worker string)
 }
 
 // nopMetrics is the default observer: the supervisor runs the same with or
@@ -60,6 +61,7 @@ type nopMetrics struct{}
 
 func (nopMetrics) AttemptStarted(string)                         {}
 func (nopMetrics) AttemptFinished(string, string, time.Duration) {}
+func (nopMetrics) ServiceRestarted(string)                       {}
 
 // Supervisor owns the lifecycle of running executions.
 type Supervisor struct {
@@ -80,12 +82,10 @@ type Supervisor struct {
 	// workers resolves the current worker definitions. Retry and log policy are
 	// read at attempt time; the command line itself is frozen on the execution.
 	workers func() *config.Registry
-	// onFinish hands an execution back to the scheduler once an attempt ends,
-	// releasing the slot the attempt held.
-	onFinish func(*core.Process)
-	// onChange reports a state change that never held a slot, such as cancelling
-	// a queued execution.
-	onChange func()
+	// onSettle hands an execution back to the scheduler whenever it stops
+	// occupying the node, so the slot it held is released and the next eligible
+	// item is looked at.
+	onSettle func(*core.Process)
 }
 
 // New wires a supervisor.
@@ -105,8 +105,7 @@ func New(
 		log:      log,
 		running:  map[string]*execution{},
 		workers:  func() *config.Registry { return nil },
-		onFinish: func(*core.Process) {},
-		onChange: func() {},
+		onSettle: func(*core.Process) {},
 	}
 }
 
@@ -116,12 +115,10 @@ func (s *Supervisor) SetWorkers(workers func() *config.Registry) { s.workers = w
 // SetMetrics injects the observer fed by every attempt.
 func (s *Supervisor) SetMetrics(m Metrics) { s.metrics = m }
 
-// SetOnFinish injects the callback invoked after every attempt ends, whatever
-// the outcome. The scheduler uses it to free the slot and look for new work.
-func (s *Supervisor) SetOnFinish(fn func(*core.Process)) { s.onFinish = fn }
-
-// SetOnChange injects the callback for state changes that held no slot.
-func (s *Supervisor) SetOnChange(fn func()) { s.onChange = fn }
+// SetOnSettle injects the callback invoked whenever an execution stops
+// occupying the node, whatever the outcome. The scheduler uses it to free the
+// slot and look for new work.
+func (s *Supervisor) SetOnSettle(fn func(*core.Process)) { s.onSettle = fn }
 
 // Running reports how many attempts are under supervision.
 func (s *Supervisor) Running() int {
@@ -135,7 +132,7 @@ func (s *Supervisor) Running() int {
 //
 // The caller has already moved the execution to STARTING and holds its slot and
 // lock. Start returns as soon as the process is running: the outcome arrives
-// through the onFinish callback.
+// through the onSettle callback.
 func (s *Supervisor) Start(ctx context.Context, caller *core.Process) error {
 	s.mu.Lock()
 	draining := s.draining
@@ -150,7 +147,7 @@ func (s *Supervisor) Start(ctx context.Context, caller *core.Process) error {
 	p := caller.Clone()
 	worker := s.worker(p.Worker)
 
-	attemptLogs, err := s.logs.Create(p.ID, p.Attempt, p.CreatedAt, logLimit(worker))
+	attemptLogs, err := s.logs.Create(p.ID, p.Attempt, p.CreatedAt, logPolicy(worker))
 	if err != nil {
 		return s.startFailed(ctx, p, worker, err)
 	}
@@ -239,7 +236,7 @@ func (s *Supervisor) startFailed(ctx context.Context, p *core.Process, worker *c
 
 	// An attempt that never became a process has an outcome but no duration.
 	s.metrics.AttemptFinished(p.Worker, string(p.State), 0)
-	s.onFinish(p)
+	s.onSettle(p)
 
 	return nil
 }
@@ -331,13 +328,22 @@ func (s *Supervisor) finish(ctx context.Context, exec *execution, result runner.
 		slog.String("signal", result.Signal),
 	)
 
-	s.onFinish(p)
+	s.onSettle(p)
 }
 
 // classify moves the execution into the state its outcome implies.
 func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.Reason, result runner.Result) {
 	p := exec.process
 	policy := retryPolicy(exec.worker)
+
+	// An intent is recorded before beginStop applies it, and the process may end
+	// on its own in between — a service exiting exactly as the daemon starts
+	// draining, for instance. The execution is then still RUNNING here, so every
+	// intent-driven outcome is routed through STOPPING rather than jumping to a
+	// state the machine does not connect to RUNNING.
+	if intent != "" && p.State == core.StateRunning {
+		s.transition(p, core.StateStopping, intent)
+	}
 
 	switch intent {
 	case core.ReasonUserRequest:
@@ -365,34 +371,52 @@ func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.
 		// Nothing asked this process to stop: classify what it reported.
 	}
 
-	if result.Signal == "" && retry.Succeeded(policy, result.ExitCode) {
+	// A service that exited has stopped doing its job, whatever it reported on
+	// the way out: for it there is no successful exit, only an exit
+	// (docs/SPEC.md §4). A task is the opposite, and its success is final.
+	if p.Type != core.TypeService && result.Signal == "" && retry.Succeeded(policy, result.ExitCode) {
 		s.transition(p, core.StateCompleted, "")
 		s.releaseLock(ctx, p)
 
 		return
 	}
 
+	// no_retry_exit_codes applies to both: an exit code that says "my
+	// configuration is wrong" is not worth restarting into forever.
+	//
+	// The failure is still reached through CRASHED. A running process that ends
+	// badly has crashed, whether or not the policy then allows another attempt,
+	// and RUNNING -> FAILED is not an edge the state machine defines.
 	if retry.Fatal(policy, result.ExitCode) {
+		s.transition(p, core.StateCrashed, "")
 		s.transition(p, core.StateFailed, core.ReasonNoRetryExit)
 		s.releaseLock(ctx, p)
 
 		return
 	}
 
-	trigger := config.RetryOnNonZeroExit
+	s.transition(p, core.StateCrashed, "")
+	s.settle(ctx, p, exec.worker, exitTrigger(p.Type, result), core.ReasonMaxAttempts)
+}
+
+// exitTrigger names the failure class an ended attempt belongs to.
+func exitTrigger(kind core.Type, result runner.Result) config.RetryTrigger {
 	if result.Signal != "" {
-		trigger = config.RetryOnSignal
+		return config.RetryOnSignal
 	}
 
-	s.transition(p, core.StateCrashed, "")
-	s.settle(ctx, p, exec.worker, trigger, core.ReasonMaxAttempts)
+	if kind == core.TypeService {
+		return config.RetryOnExit
+	}
+
+	return config.RetryOnNonZeroExit
 }
 
 // classifyShutdown records an execution stopped because the daemon is going
 // down. Workers that opt into on_shutdown go back to the queue so the next
 // daemon start picks them up.
 func (s *Supervisor) classifyShutdown(ctx context.Context, p *core.Process, policy config.Retry) {
-	if policy.Enabled && policy.OnShutdown {
+	if policy.IsEnabled() && policy.OnShutdown {
 		s.transition(p, core.StateQueued, core.ReasonShutdown)
 
 		return
@@ -429,6 +453,10 @@ func (s *Supervisor) settle(
 	p.RetryAt = &retryAt
 
 	s.transition(p, core.StateRetrying, "")
+
+	if p.Type == core.TypeService {
+		s.metrics.ServiceRestarted(p.Worker)
+	}
 }
 
 // transition applies a state change, logging the ones the state machine does
@@ -489,12 +517,15 @@ func killGrace(worker *config.Worker) time.Duration {
 	return worker.KillGrace.Duration()
 }
 
-func logLimit(worker *config.Worker) int64 {
+func logPolicy(worker *config.Worker) logstore.Policy {
 	if worker == nil {
-		return 0
+		return logstore.Policy{}
 	}
 
-	return worker.Logs.MaxBytesPerStream.Bytes()
+	return logstore.Policy{
+		MaxBytesPerStream: worker.Logs.MaxBytesPerStream.Bytes(),
+		MaxFiles:          worker.Logs.Rotate.MaxFiles,
+	}
 }
 
 // errNotRunning wraps the domain error with the execution id.

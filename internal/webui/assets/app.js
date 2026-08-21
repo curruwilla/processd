@@ -103,6 +103,12 @@ function cell(text, className) {
   return td;
 }
 
+// A service restarts for as long as it is meant to run, so it reports no
+// attempt ceiling at all.
+function attemptCeiling(item) {
+  return item.max_attempts === null ? '\u221e' : item.max_attempts;
+}
+
 function processRow(item, columns) {
   const row = document.createElement('tr');
   row.append(cell(short(item.id), 'id'));
@@ -111,7 +117,7 @@ function processRow(item, columns) {
   const status = cell(item.status, 'state state-' + item.status);
   row.append(status);
 
-  row.append(cell(item.attempt + '/' + item.max_attempts, ''));
+  row.append(cell(item.attempt + '/' + attemptCeiling(item), ''));
   if (columns.pid) row.append(cell(item.pid ? String(item.pid) : '—', ''));
   row.append(cell(duration(item.duration_ms), ''));
   row.append(cell(when(item.created_at), ''));
@@ -305,7 +311,7 @@ async function refreshDrawer() {
   fields.textContent = '';
   field(fields, 'command', [item.command, ...(item.args || [])].join(' '));
   field(fields, 'cwd', item.cwd);
-  field(fields, 'attempt', item.attempt + ' of ' + item.max_attempts);
+  field(fields, 'attempt', item.attempt + ' of ' + attemptCeiling(item));
   field(fields, 'pid', item.pid || '—');
   field(fields, 'exit code', item.exit_code === null ? '—' : item.exit_code);
   if (item.signal) field(fields, 'signal', item.signal);
@@ -321,7 +327,7 @@ async function refreshDrawer() {
     field(fields, 'threads', item.usage.threads);
   }
 
-  if (item.log_truncated) field(fields, 'logs', 'truncated at the size cap');
+  if (item.log_truncated) field(fields, 'logs', 'output dropped: size cap or rotation');
 
   const attempts = el('log-attempt');
   const wanted = Math.max(item.attempt, 1);
@@ -401,7 +407,7 @@ async function readLogs() {
 
   el('log-status').textContent = body.lines.length ? body.lines.length + ' lines' : 'no output';
 
-  if (body.truncated) pushLine('— output truncated at the size cap', 'meta');
+  if (body.truncated) pushLine('— some output was dropped: size cap or rotation', 'meta');
 }
 
 function followLogs() {
@@ -468,7 +474,7 @@ function handleEvent(frame) {
   if (name === 'end') {
     const payload = JSON.parse(data);
     pushLine('— attempt ' + payload.attempt + ' ended: ' + payload.status +
-      (payload.truncated ? ' (output truncated)' : ''), 'meta');
+      (payload.truncated ? ' (some output dropped)' : ''), 'meta');
     el('log-status').textContent = 'ended';
     refreshDrawer().catch(fail);
   }

@@ -60,7 +60,7 @@ func printLogs(cmd *cobra.Command, id string, values url.Values) error {
 	}
 
 	if body.Truncated {
-		fmt.Fprintln(cmd.ErrOrStderr(), "output was truncated at the configured size cap")
+		fmt.Fprintln(cmd.ErrOrStderr(), "some output was dropped: the stream hit its size cap or rotated past max_files")
 	}
 
 	return nil
@@ -103,7 +103,7 @@ func followLogs(cmd *cobra.Command, id string, values url.Values) error {
 			}
 
 			if end.Truncated {
-				fmt.Fprintln(cmd.ErrOrStderr(), "output was truncated at the configured size cap")
+				fmt.Fprintln(cmd.ErrOrStderr(), "some output was dropped: the stream hit its size cap or rotated past max_files")
 			}
 
 			fmt.Fprintf(cmd.ErrOrStderr(), "attempt %d ended: %s\n", end.Attempt, end.Status)

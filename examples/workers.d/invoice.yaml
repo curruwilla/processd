@@ -53,6 +53,11 @@ workers:
         multiplier: 2
         jitter: 0.2
 
-    # Only the size cap is per worker: retention belongs to the daemon.
+    # Only the size cap and rotation are per worker: retention belongs to the
+    # daemon. Without rotation the stream stops storing once it fills the cap,
+    # which is the right trade for a task whose attempt is short.
     logs:
       max_bytes_per_stream: 32MiB
+      rotate:
+        max_files: 0
+

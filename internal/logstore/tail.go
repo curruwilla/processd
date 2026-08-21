@@ -88,6 +88,10 @@ type tailSource struct {
 	stream  Stream
 	offset  int64
 	partial []byte
+
+	// info identifies the file the previous poll read, so that a rotation is
+	// recognised even when the replacement happens to be the same size.
+	info os.FileInfo
 }
 
 func (t *tailSource) read() ([]Line, error) {
@@ -105,6 +109,10 @@ func (t *tailSource) read() ([]Line, error) {
 		_ = file.Close()
 	}()
 
+	if err := t.rewindIfRotated(file); err != nil {
+		return nil, err
+	}
+
 	if _, err := file.Seek(t.offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seeking log file %q: %w", t.path, err)
 	}
@@ -117,6 +125,38 @@ func (t *tailSource) read() ([]Line, error) {
 	t.offset += int64(len(chunk))
 
 	return t.split(chunk), nil
+}
+
+// rewindIfRotated restarts the follower at the top of the file when the stream
+// has rotated underneath it.
+//
+// The live file always keeps the same path, so rotation replaces the file the
+// follower is reading rather than moving it. Comparing identity catches that
+// even when the replacement happens to be the same size, which a size
+// comparison alone cannot; the size check stays as the case for a file
+// truncated in place.
+//
+// Whatever the follower had not read yet moved into the previous generation and
+// is not chased: a follower is a view of what the process is writing now, and
+// reaching backwards for it would race the next rotation anyway. Lines(…) reads
+// the full history, rotations included.
+func (t *tailSource) rewindIfRotated(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("sizing log file %q: %w", t.path, err)
+	}
+
+	replaced := t.info != nil && !os.SameFile(t.info, info)
+	t.info = info
+
+	if !replaced && info.Size() >= t.offset {
+		return nil
+	}
+
+	t.offset = 0
+	t.partial = nil
+
+	return nil
 }
 
 // split turns the bytes read so far into whole lines, keeping the remainder for

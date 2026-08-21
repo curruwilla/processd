@@ -42,7 +42,19 @@ const (
 	RetryOnSignal      RetryTrigger = "signal"
 	RetryOnStartError  RetryTrigger = "start_error"
 	RetryOnTimeout     RetryTrigger = "timeout"
+	// RetryOnExit is any exit at all, the successful ones included. Only a
+	// service may declare it: for a task, exiting is the point.
+	RetryOnExit RetryTrigger = "exit"
 )
+
+// retryTriggers is every trigger the supervisor knows how to report.
+var retryTriggers = []RetryTrigger{
+	RetryOnNonZeroExit,
+	RetryOnSignal,
+	RetryOnStartError,
+	RetryOnTimeout,
+	RetryOnExit,
+}
 
 // Overridable names a field a request is allowed to override.
 type Overridable string
@@ -94,9 +106,14 @@ type Param struct {
 }
 
 // Retry is the restart policy of a worker (docs/SPEC.md §12).
+//
+// Enabled is a pointer so that "the operator said nothing" stays distinct from
+// "the operator said no": a task defaults to no retries and a service to
+// restarting forever, and an explicit `enabled: false` on a service is a
+// contradiction the loader refuses rather than resolves.
 type Retry struct {
-	Enabled          bool           `yaml:"enabled"`
-	MaxAttempts      int            `yaml:"max_attempts"`
+	Enabled          *bool          `yaml:"enabled"`
+	MaxAttempts      Attempts       `yaml:"max_attempts"`
 	RetryOn          []RetryTrigger `yaml:"retry_on"`
 	SuccessExitCodes []int          `yaml:"success_exit_codes"`
 	NoRetryExitCodes []int          `yaml:"no_retry_exit_codes"`
@@ -120,19 +137,38 @@ type Backoff struct {
 // age, and asking it which worker wrote each one would turn a directory walk
 // into one store lookup per file (docs/SPEC.md §10).
 type WorkerLogs struct {
-	MaxBytesPerStream ByteSize `yaml:"max_bytes_per_stream"`
+	MaxBytesPerStream ByteSize  `yaml:"max_bytes_per_stream"`
+	Rotate            LogRotate `yaml:"rotate"`
+}
+
+// LogRotate keeps a long-lived stream readable past its size cap by moving the
+// full file aside instead of dropping what follows it.
+//
+// Without rotation a stream goes silent the first time it fills its cap. That
+// is the right trade for a task, whose attempt is short by definition, and
+// unusable for a service, whose single attempt may run for months — which is
+// why a service must configure it (docs/SPEC.md §10).
+type LogRotate struct {
+	// MaxFiles is how many rotated files are kept behind the live one. Zero
+	// disables rotation.
+	MaxFiles int `yaml:"max_files"`
 }
 
 // IsEnabled reports whether the worker may be executed. Workers are enabled
 // unless the file says otherwise.
 func (w *Worker) IsEnabled() bool { return w.Enabled == nil || *w.Enabled }
 
+// IsEnabled reports whether the policy retries at all. The loader resolves the
+// default for the worker type, so a policy that reached this point has an
+// answer.
+func (r Retry) IsEnabled() bool { return r.Enabled != nil && *r.Enabled }
+
 // Allows reports whether a request may override the given field.
 func (w *Worker) Allows(field Overridable) bool { return slices.Contains(w.Overridable, field) }
 
 // RetriesOn reports whether the trigger is in the worker's retry policy.
 func (w *Worker) RetriesOn(trigger RetryTrigger) bool {
-	return w.Retry.Enabled && slices.Contains(w.Retry.RetryOn, trigger)
+	return w.Retry.IsEnabled() && slices.Contains(w.Retry.RetryOn, trigger)
 }
 
 // workersFile is the on-disk shape of a file in workers.d.
@@ -241,21 +277,42 @@ func applyWorkerDefaults(w *Worker) {
 		w.KillGrace = Duration(15 * time.Second)
 	}
 
-	if w.Retry.Enabled {
-		applyRetryDefaults(&w.Retry)
+	// A service restarts by definition, so its policy is filled in whether or
+	// not the file mentions retries; a task only gets one when it asks.
+	if w.Type == core.TypeService && w.Retry.Enabled == nil {
+		enabled := true
+		w.Retry.Enabled = &enabled
+	}
+
+	if w.Retry.IsEnabled() {
+		applyRetryDefaults(&w.Retry, w.Type)
 	}
 }
 
-func applyRetryDefaults(r *Retry) {
+func applyRetryDefaults(r *Retry, kind core.Type) {
+	service := kind == core.TypeService
+
 	if r.MaxAttempts == 0 {
+		// Something meant to run forever has no attempt budget to spend; a task
+		// that keeps failing has to stop somewhere.
 		r.MaxAttempts = 1
+		if service {
+			r.MaxAttempts = AttemptsUnlimited
+		}
 	}
 
 	if len(r.RetryOn) == 0 {
 		r.RetryOn = []RetryTrigger{RetryOnNonZeroExit, RetryOnSignal, RetryOnStartError}
+		if service {
+			// Every way a service can stop running is a reason to start it again,
+			// a clean exit included.
+			r.RetryOn = append(r.RetryOn, RetryOnExit)
+		}
 	}
 
-	if len(r.SuccessExitCodes) == 0 {
+	// No exit code means success for a service, so it never gets the default a
+	// task gets, and declaring one is refused outright.
+	if len(r.SuccessExitCodes) == 0 && !service {
 		r.SuccessExitCodes = []int{0}
 	}
 
@@ -286,7 +343,9 @@ func (w *Worker) Validate() error {
 		errs = append(errs, errors.New("name must not be empty"))
 	}
 
-	if w.Type != core.TypeTask {
+	switch w.Type {
+	case core.TypeTask, core.TypeService:
+	default:
 		errs = append(errs, fmt.Errorf("type %q: %w", w.Type, core.ErrUnsupportedType))
 	}
 
@@ -310,6 +369,8 @@ func (w *Worker) Validate() error {
 
 	errs = append(errs, w.validateParams()...)
 	errs = append(errs, w.validateRetry()...)
+	errs = append(errs, w.validateLogs()...)
+	errs = append(errs, w.validateType()...)
 
 	return errors.Join(errs...)
 }
@@ -352,14 +413,14 @@ func (w *Worker) validateParams() []error {
 }
 
 func (w *Worker) validateRetry() []error {
-	if !w.Retry.Enabled {
+	if !w.Retry.IsEnabled() {
 		return nil
 	}
 
 	errs := []error{}
 
-	if w.Retry.MaxAttempts < 1 {
-		errs = append(errs, errors.New("retry.max_attempts must be at least 1"))
+	if w.Retry.MaxAttempts < 1 && !w.Retry.MaxAttempts.Unlimited() {
+		errs = append(errs, errors.New(`retry.max_attempts must be at least 1, or "unlimited"`))
 	}
 
 	if w.Retry.Backoff.Jitter < 0 || w.Retry.Backoff.Jitter > 1 {
@@ -373,11 +434,76 @@ func (w *Worker) validateRetry() []error {
 	}
 
 	for _, trigger := range w.Retry.RetryOn {
-		switch trigger {
-		case RetryOnNonZeroExit, RetryOnSignal, RetryOnStartError, RetryOnTimeout:
-		default:
+		if !slices.Contains(retryTriggers, trigger) {
 			errs = append(errs, fmt.Errorf("retry.retry_on %q is unknown", trigger))
 		}
+	}
+
+	return errs
+}
+
+// validateLogs rejects a log policy that cannot bound what it stores.
+func (w *Worker) validateLogs() []error {
+	if w.Logs.Rotate.MaxFiles < 0 {
+		return []error{errors.New("logs.rotate.max_files must not be negative")}
+	}
+
+	return nil
+}
+
+// validateType enforces the rules that only make sense for one execution type.
+// The two have opposite semantics (docs/SPEC.md §4), so a key that is ordinary
+// on one side is a contradiction on the other and is refused rather than
+// ignored.
+func (w *Worker) validateType() []error {
+	if w.Type == core.TypeService {
+		return w.validateService()
+	}
+
+	errs := []error{}
+
+	if slices.Contains(w.Retry.RetryOn, RetryOnExit) {
+		errs = append(errs, fmt.Errorf(
+			"retry.retry_on %q is only valid for a service: a task that exits has finished",
+			RetryOnExit,
+		))
+	}
+
+	if w.Retry.MaxAttempts.Unlimited() {
+		errs = append(errs, errors.New(
+			`retry.max_attempts "unlimited" is only valid for a service`,
+		))
+	}
+
+	return errs
+}
+
+func (w *Worker) validateService() []error {
+	errs := []error{}
+
+	if w.Retry.Enabled != nil && !*w.Retry.Enabled {
+		errs = append(errs, errors.New(
+			"retry.enabled must not be false for a service: a service that is not restarted is a task",
+		))
+	}
+
+	if w.Timeout != 0 {
+		errs = append(errs, errors.New(
+			"timeout must not be set for a service: a service has no deadline to exceed",
+		))
+	}
+
+	if len(w.Retry.SuccessExitCodes) > 0 {
+		errs = append(errs, errors.New(
+			"retry.success_exit_codes must not be set for a service: every exit is abnormal",
+		))
+	}
+
+	if w.Logs.Rotate.MaxFiles < 1 {
+		errs = append(errs, errors.New(
+			"logs.rotate.max_files must be at least 1 for a service: "+
+				"a single attempt runs long enough to fill its cap and would then store nothing",
+		))
 	}
 
 	return errs

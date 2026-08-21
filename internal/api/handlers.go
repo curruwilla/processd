@@ -19,6 +19,7 @@ import (
 	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/core"
 	"github.com/curruwilla/processd/internal/logstore"
+	"github.com/curruwilla/processd/internal/retry"
 	"github.com/curruwilla/processd/internal/runner"
 	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/version"
@@ -184,17 +185,15 @@ func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
 // buildProcess turns a request into the effective execution definition. The
 // definition is frozen here: reloading workers.d later never mutates it.
 func (s *Server) buildProcess(r *http.Request, req createProcessRequest) (*core.Process, error) {
-	if req.Type == "" {
-		req.Type = core.TypeTask
-	}
-
-	if req.Type != core.TypeTask {
+	switch req.Type {
+	case "", core.TypeTask, core.TypeService:
+	default:
 		return nil, fmt.Errorf("type %q: %w", req.Type, core.ErrUnsupportedType)
 	}
 
 	process := &core.Process{
 		ID:        core.NewProcessID(),
-		Type:      req.Type,
+		Type:      core.TypeTask,
 		State:     core.StateCreated,
 		Metadata:  req.Metadata,
 		CreatedAt: time.Now().UTC(),
@@ -231,6 +230,13 @@ func (s *Server) applyRawCommand(process *core.Process, req createProcessRequest
 		return fmt.Errorf("command %q is not allowlisted: %w", req.Command, core.ErrRawCommandDenied)
 	}
 
+	// A raw command is already the sharpest edge in the API. Supervising one
+	// forever, with no worker definition bounding it, is not an edge worth
+	// adding: a service is declared in workers.d or not at all.
+	if req.Type == core.TypeService {
+		return fmt.Errorf("type %q: %w", req.Type, core.ErrRawCommandDenied)
+	}
+
 	process.Command = req.Command
 	process.Args = req.Args
 	process.Env = req.Env
@@ -265,6 +271,17 @@ func (s *Server) applyWorker(r *http.Request, process *core.Process, req createP
 		return err
 	}
 
+	// The worker definition decides what kind of execution this is. A request
+	// may state the type, but only to agree with it: running a service worker as
+	// a task would silently drop its restart policy.
+	if req.Type != "" && req.Type != worker.Type {
+		return fmt.Errorf(
+			"worker %q is a %s, not a %s: %w",
+			worker.Name, worker.Type, req.Type, core.ErrUnsupportedType,
+		)
+	}
+
+	process.Type = worker.Type
 	process.Worker = worker.Name
 	process.Command = worker.Command
 	process.Args = resolved.Args
@@ -273,7 +290,7 @@ func (s *Server) applyWorker(r *http.Request, process *core.Process, req createP
 	process.Group = worker.Group
 	process.Lock = resolved.Lock
 	process.Timeout = worker.Timeout.Duration()
-	process.MaxAttempts = max(worker.Retry.MaxAttempts, 1)
+	process.MaxAttempts = retry.Attempts(worker.Retry)
 	process.Env = maps.Clone(worker.Env)
 
 	return applyOverrides(process, worker, req)
@@ -295,6 +312,12 @@ func applyOverrides(process *core.Process, worker *config.Worker, req createProc
 	}
 
 	if req.Timeout != "" {
+		// A service has no deadline to exceed, so its worker cannot declare a
+		// timeout and a request cannot smuggle one in either.
+		if process.Type == core.TypeService {
+			return badRequest("timeout_denied", "a service has no timeout")
+		}
+
 		if !worker.Allows(config.OverridableTimeout) {
 			return badRequest("override_denied", "worker does not allow timeout overrides")
 		}

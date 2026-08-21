@@ -57,6 +57,12 @@ workers:
   - name: exclusive
     command: /bin/echo
     lock_conflict: reject
+  - name: api
+    type: service
+    command: /usr/bin/api
+    logs:
+      rotate:
+        max_files: 3
 `
 
 func newScheduler(t *testing.T, tune func(*config.Config)) (*Scheduler, store.Store, *fakeStarter) {
@@ -92,6 +98,14 @@ func newScheduler(t *testing.T, tune func(*config.Config)) (*Scheduler, store.St
 	starter := &fakeStarter{}
 
 	return New(cfg, db, registry, starter, slog.New(slog.DiscardHandler)), db, starter
+}
+
+func newService(id string) *core.Process {
+	p := newSubmission(id, "api", "")
+	p.Type = core.TypeService
+	p.MaxAttempts = config.AttemptsUnlimited
+
+	return p
 }
 
 func newSubmission(id, worker, lock string) *core.Process {
@@ -275,7 +289,7 @@ func TestScheduler_dispatch(t *testing.T) {
 			running = append(running, p)
 		}
 
-		scheduler.OnAttemptFinished(running[0])
+		scheduler.OnExecutionSettled(running[0])
 		scheduler.dispatch(ctx)
 
 		if starter.count() != 3 {
@@ -316,4 +330,192 @@ func TestScheduler_dispatch(t *testing.T) {
 			t.Errorf("expired execution is %s/%s, want FAILED/queue_timeout", stored.State, stored.Reason)
 		}
 	})
+}
+
+// A service takes a slot at admission or not at all (docs/SPEC.md §4): parking
+// one would leave something meant to be running listed as merely waiting, with
+// no bound on how long.
+func TestScheduler_Submit_service(t *testing.T) {
+	t.Parallel()
+
+	t.Run("starts while the node has room", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _, starter := newScheduler(t, nil)
+
+		p := newService("svc_1")
+		if err := scheduler.Submit(t.Context(), p); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+
+		if p.State != core.StateStarting {
+			t.Errorf("state = %s, want %s", p.State, core.StateStarting)
+		}
+
+		if starter.count() != 1 {
+			t.Errorf("starter ran %d executions, want 1", starter.count())
+		}
+	})
+
+	t.Run("is refused rather than queued when the node is full", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, db, starter := newScheduler(t, nil)
+		ctx := t.Context()
+
+		for i := range 2 {
+			if err := scheduler.Submit(ctx, newSubmission("proc_"+string(rune('a'+i)), "invoice", "")); err != nil {
+				t.Fatalf("Submit() returned %v, want nil", err)
+			}
+		}
+
+		err := scheduler.Submit(ctx, newService("svc_1"))
+		if !errors.Is(err, core.ErrNoCapacity) {
+			t.Fatalf("Submit() returned %v, want core.ErrNoCapacity", err)
+		}
+
+		if starter.count() != 2 {
+			t.Errorf("starter ran %d executions, want the service not to have started", starter.count())
+		}
+
+		stored, err := db.GetProcess(ctx, "svc_1")
+		if err != nil {
+			t.Fatalf("GetProcess() returned %v, want nil", err)
+		}
+
+		if stored.State != core.StateCanceled || stored.Reason != core.ReasonNoCapacity {
+			t.Errorf("refused service is %s/%s, want CANCELED/no_capacity", stored.State, stored.Reason)
+		}
+	})
+
+	t.Run("a full queue says nothing about a service", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _, _ := newScheduler(t, func(cfg *config.Config) {
+			cfg.MaxProcesses = 3
+			cfg.Queue.MaxDepth = 1
+		})
+		ctx := t.Context()
+
+		// Fill the queue with tasks the node has no slots for.
+		for i := range 4 {
+			_ = scheduler.Submit(ctx, newSubmission("proc_"+string(rune('a'+i)), "invoice", ""))
+		}
+
+		// The invoice worker is capped at two, so a slot is still free overall.
+		if err := scheduler.Submit(ctx, newService("svc_1")); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+	})
+}
+
+// The slot a service holds spans its whole life, not one attempt: releasing it
+// during a backoff would let a task take the room the service needs to come
+// back.
+func TestScheduler_OnExecutionSettled_service(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a restarting service keeps its slot", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _, _ := newScheduler(t, nil)
+
+		p := newService("svc_1")
+		if err := scheduler.Submit(t.Context(), p); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+
+		p.State = core.StateRetrying
+		scheduler.OnExecutionSettled(p)
+
+		if !scheduler.Slots().Holds("svc_1") {
+			t.Error("Holds() = false, want the service to keep its slot across the restart")
+		}
+
+		if used, _ := scheduler.Slots().Usage(); used != 1 {
+			t.Errorf("Usage() used = %d, want 1", used)
+		}
+	})
+
+	// Stopping a service during its backoff is the one path where nothing
+	// "finished": the slot is held by the execution, so cancelling it has to
+	// release the slot just like a finished attempt does.
+	t.Run("a service cancelled mid-backoff gives its slot back", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _, _ := newScheduler(t, nil)
+
+		p := newService("svc_1")
+		if err := scheduler.Submit(t.Context(), p); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+
+		p.State = core.StateRetrying
+		scheduler.OnExecutionSettled(p)
+
+		p.State = core.StateCanceled
+		scheduler.OnExecutionSettled(p)
+
+		if scheduler.Slots().Holds("svc_1") {
+			t.Error("Holds() = true, want the cancelled service to free its slot")
+		}
+
+		if used, _ := scheduler.Slots().Usage(); used != 0 {
+			t.Errorf("Usage() used = %d, want 0", used)
+		}
+	})
+
+	t.Run("a service that reached a terminal state gives its slot back", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, _, _ := newScheduler(t, nil)
+
+		p := newService("svc_1")
+		if err := scheduler.Submit(t.Context(), p); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+
+		p.State = core.StateCanceled
+		scheduler.OnExecutionSettled(p)
+
+		if scheduler.Slots().Holds("svc_1") {
+			t.Error("Holds() = true, want a stopped service to free its slot")
+		}
+	})
+}
+
+// A service only passes through the queue on its way back from a daemon restart
+// it was told to survive, so item_ttl must not fail it for having waited.
+func TestScheduler_expire_service(t *testing.T) {
+	t.Parallel()
+
+	scheduler, db, _ := newScheduler(t, func(cfg *config.Config) {
+		cfg.MaxProcesses = 1
+		cfg.Queue.ItemTTL = config.Duration(time.Nanosecond)
+	})
+	ctx := t.Context()
+
+	if err := scheduler.Submit(ctx, newSubmission("proc_running", "invoice", "")); err != nil {
+		t.Fatalf("Submit() returned %v, want nil", err)
+	}
+
+	// A service that survived a shutdown is stored as QUEUED, the state the
+	// supervisor leaves it in for the next daemon to pick up.
+	queued := newService("svc_1")
+	queued.State = core.StateQueued
+
+	if err := db.CreateProcess(ctx, queued); err != nil {
+		t.Fatalf("CreateProcess() returned %v, want nil", err)
+	}
+
+	scheduler.dispatch(ctx)
+
+	stored, err := db.GetProcess(ctx, "svc_1")
+	if err != nil {
+		t.Fatalf("GetProcess() returned %v, want nil", err)
+	}
+
+	if stored.State == core.StateFailed {
+		t.Errorf("state = %s/%s, want the queued service to survive item_ttl", stored.State, stored.Reason)
+	}
 }

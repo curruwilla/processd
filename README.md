@@ -23,7 +23,8 @@ Ainda não foi usado em produção: trate a primeira instalação como piloto.
 | Fila, limites global e por worker, TTL de fila | pronto |
 | Locks persistidos (`queue` e `reject`) | pronto |
 | Retry com backoff, jitter, `reset_after`, exit codes fatais | pronto |
-| Captura de logs por tentativa, com limite de tamanho e leitura pela API | pronto |
+| `type: service`: restart contínuo, tentativas ilimitadas, slot reservado | pronto |
+| Captura de logs por tentativa, com limite de tamanho, rotação e leitura pela API | pronto |
 | Persistência SQLite, histórico e trilha de auditoria | pronto |
 | Crash recovery: fingerprint `(pid, starttime)`, `orphan_policy` | pronto |
 | Graceful shutdown do daemon e da árvore de processos | pronto |
@@ -34,7 +35,7 @@ Ainda não foi usado em produção: trate a primeira instalação como piloto.
 | Console web embutido em `/ui/` | pronto |
 | CLI completa | pronto |
 
-Fora do MVP, por decisão: `type: service` e desired state, execução distribuída (Agents), TLS nativo,
+Fora do escopo, por decisão: desired state e réplicas, execução distribuída (Agents), TLS nativo,
 tracing OpenTelemetry. Ver [docs/SPEC.md](docs/SPEC.md) §22 e §25.
 
 ## O que faz
@@ -234,6 +235,32 @@ workers:
       backoff: { type: exponential, initial: 10s, max: 2m, jitter: 0.2 }
 ```
 
+Um `service` — algo que não deve terminar — declara `type: service`. Os defaults de restart vêm de
+graça; só a rotação de log é obrigatória, porque uma tentativa que dura meses enche o cap e depois
+emudeceria:
+
+```yaml
+# /etc/processd/workers.d/api.yaml
+version: 1
+workers:
+  - name: api
+    type: service
+    command: /usr/local/bin/api
+    cwd: /srv/api
+    user: api
+    kill_grace: 30s
+    retry:
+      no_retry_exit_codes: [78]     # config inválida não vale reiniciar em loop
+      reset_after: 10m
+      on_shutdown: true             # volta a subir no próximo start do daemon
+      backoff: { type: exponential, initial: 1s, max: 1m, jitter: 0.2 }
+    logs:
+      rotate: { max_files: 5 }
+```
+
+`DELETE /v1/processes/{id}` para um `service` significa "pare e não reinicie"; subir de novo é uma
+execução nova. O contraste completo entre os dois tipos está em [docs/SPEC.md](docs/SPEC.md) §4.
+
 Referência completa dos campos em [Definição de workers](#definição-de-workers). A carga é
 tudo-ou-nada: um arquivo inválido derruba o reload inteiro, então um worker nunca desaparece em
 silêncio de um daemon vivo.
@@ -344,7 +371,7 @@ sufixo IEC ou SI: `32MiB`, `32MB`, ou bytes puros.
 |---|---|---|---|
 | `name` | string | — obrigatório | único entre todos os arquivos |
 | `enabled` | bool | `true` | `false` faz o daemon carregar o worker e recusar execuções com `422` |
-| `type` | enum | `task` | `task` é o único aceito hoje; `service` é reservado para a fase 4 |
+| `type` | enum | `task` | `task` termina e o sucesso é final; `service` não deve terminar e qualquer saída reinicia. O tipo é do worker: um request pode declará-lo, mas só para concordar |
 | `command` | string | — obrigatório | caminho **absoluto**, executado direto — nunca por shell |
 | `args` | lista de strings | `[]` | pode conter `{{param}}`; a substituição não divide elementos |
 | `params` | mapa | `{}` | declaração dos valores que o request pode enviar (tabela abaixo) |
@@ -353,14 +380,15 @@ sufixo IEC ou SI: `32MiB`, `32MB`, ou bytes puros.
 | `group` | string | grupo primário do `user` | nome de grupo do sistema; grupos suplementares são aplicados |
 | `env` | mapa string→string | `{}` | ambiente do filho. O ambiente do daemon **não** é herdado: ele guarda segredos |
 | `env_passthrough` | lista de strings | `[]` | nomes de variáveis do daemon repassadas explicitamente, ex.: `[PATH, LANG, TZ]` |
-| `timeout` | duração | `0` = sem timeout | ao estourar: `SIGTERM` no grupo → `kill_grace` → `SIGKILL` |
+| `timeout` | duração | `0` = sem timeout | ao estourar: `SIGTERM` no grupo → `kill_grace` → `SIGKILL`. Recusado em um `service`: não há prazo a estourar |
 | `kill_grace` | duração | `15s` | espera entre o `SIGTERM` e o `SIGKILL` |
-| `max_processes` | int ≥ 0 | `0` = só o limite global | teto de simultâneas do worker; o excedente **espera na fila**, não é recusado |
+| `max_processes` | int ≥ 0 | `0` = só o limite global | teto de simultâneas do worker; o excedente **espera na fila**, não é recusado. Um `service` sem slot é recusado com `503`, nunca enfileirado |
 | `lock` | string | vazio = sem lock | chave de exclusão mútua, pode conter `{{param}}` |
 | `lock_conflict` | enum | `queue` | `queue` espera o lock liberar; `reject` responde `409` na hora |
 | `overridable` | lista enum | `[]` | o que o request pode sobrescrever: `env`, `timeout`, `lock`. Override não listado → `400` |
 | `retry` | objeto | desligado | tabela abaixo |
 | `logs.max_bytes_per_stream` | tamanho | o valor do daemon (`32MiB`) | cap por stream por tentativa; a retenção é do daemon, não do worker |
+| `logs.rotate.max_files` | int ≥ 0 | `0` = sem rotação | quantos arquivos rotacionados manter atrás do vivo. Sem rotação o stream emudece ao encher o cap — **obrigatório em um `service`**, cuja tentativa pode durar meses |
 
 ### `params`
 
@@ -384,22 +412,24 @@ Substituição (`docs/SPEC.md` §5.3):
 
 ### `retry`
 
-Os defaults abaixo só são aplicados quando `enabled: true`.
+Os defaults abaixo só são aplicados quando o retry está ligado. `enabled` é tri-estado: ausente não
+é o mesmo que `false`. Uma `task` sem a chave não tenta de novo; um `service` sem a chave reinicia, e
+`enabled: false` explícito em um `service` é recusado na carga.
 
-| Chave | Tipo | Default | Valores |
-|---|---|---|---|
-| `enabled` | bool | `false` | sem isso, uma tentativa e pronto |
-| `max_attempts` | int ≥ 1 | `1` | total, incluindo a primeira tentativa |
-| `retry_on` | lista enum | `[nonzero_exit, signal, start_error]` | `nonzero_exit`, `signal`, `start_error`, `timeout` |
-| `success_exit_codes` | lista de int | `[0]` | código listado → `COMPLETED` |
-| `no_retry_exit_codes` | lista de int | `[]` | código listado → `FAILED` imediato, sem retry |
-| `reset_after` | duração | `0` = desligado | tentativa que durou mais que isso zera o contador |
-| `on_shutdown` | bool | `false` | `true` devolve a execução à fila no shutdown, em vez de cancelá-la |
-| `backoff.type` | enum | `exponential` | `exponential`, `linear`, `fixed` |
-| `backoff.initial` | duração | `5s` | atraso da primeira repetição |
-| `backoff.max` | duração | `5m` | teto do atraso |
-| `backoff.multiplier` | float > 0 | `2` | usado só por `exponential` |
-| `backoff.jitter` | float 0..1 | `0` | espalha o atraso em `±jitter`; sem ele, tudo que falhou junto repete junto |
+| Chave | Tipo | Default (`task`) | Default (`service`) | Valores |
+|---|---|---|---|---|
+| `enabled` | bool | `false` | `true`, e não pode ser `false` | sem isso, uma tentativa e pronto |
+| `max_attempts` | int ≥ 1 ou `unlimited` | `1` | `unlimited` | total, incluindo a primeira tentativa. `unlimited` só é aceito em um `service` |
+| `retry_on` | lista enum | `[nonzero_exit, signal, start_error]` | o mesmo, mais `exit` | `nonzero_exit`, `signal`, `start_error`, `timeout`, `exit`. `exit` é qualquer saída, sucesso incluído, e só é aceito em um `service` |
+| `success_exit_codes` | lista de int | `[0]` | nenhum; declarar é recusado | código listado → `COMPLETED` |
+| `no_retry_exit_codes` | lista de int | `[]` | `[]` | código listado → `FAILED` imediato, sem retry |
+| `reset_after` | duração | `0` = desligado | `0` = desligado | tentativa que durou mais que isso zera o contador |
+| `on_shutdown` | bool | `false` | `false` | `true` devolve a execução à fila no shutdown, em vez de cancelá-la |
+| `backoff.type` | enum | `exponential` | `exponential` | `exponential`, `linear`, `fixed` |
+| `backoff.initial` | duração | `5s` | `5s` | atraso da primeira repetição |
+| `backoff.max` | duração | `5m` | `5m` | teto do atraso |
+| `backoff.multiplier` | float > 0 | `2` | `2` | usado só por `exponential` |
+| `backoff.jitter` | float 0..1 | `0` | `0` | espalha o atraso em `±jitter`; sem ele, tudo que falhou junto repete junto |
 
 Curvas: `fixed` = `initial`; `linear` = `initial × tentativa`; `exponential` =
 `initial × multiplier^(tentativa-1)`. O teto `max` é aplicado antes do jitter.
@@ -515,7 +545,7 @@ Detalhes em [docs/SPEC.md §16](docs/SPEC.md).
 | 1 ✅ | Process manager local: API, estados, persistência, auth |
 | 2 ✅ | Supervisor: fila, locks, retry/backoff, timeout, recovery |
 | 3 ✅ | Observabilidade: métricas, streaming de logs, CPU/memória, Web UI |
-| 4 | `type: service` e desired state local |
+| 4 ✅ | `type: service`: restart contínuo e rotação de log *(desired state local segue fora)* |
 | 5 | Agents e execução distribuída |
 
 ---

@@ -34,6 +34,7 @@ const (
 	ReasonNoRetryExit   Reason = "no_retry_exit_code"
 	ReasonLockConflict  Reason = "lock_conflict"
 	ReasonOrphaned      Reason = "orphaned"
+	ReasonNoCapacity    Reason = "no_capacity"
 )
 
 // Process is one execution, identified by a stable logical ID that survives

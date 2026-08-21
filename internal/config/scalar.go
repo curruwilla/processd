@@ -172,3 +172,78 @@ func (b *ByteSize) UnmarshalYAML(node *yaml.Node) error {
 
 // MarshalYAML encodes the byte size back to its string form.
 func (b ByteSize) MarshalYAML() (any, error) { return b.String(), nil }
+
+// AttemptsUnlimited is the attempt ceiling of a policy that has none. It is a
+// distinct value rather than zero because zero is what an omitted key decodes
+// to, and "the operator said nothing" must never mean "retry forever".
+const AttemptsUnlimited = -1
+
+// unlimitedAttempts is how an absent ceiling is written in YAML.
+const unlimitedAttempts = "unlimited"
+
+// Attempts is an attempt ceiling that decodes from a positive integer or from
+// the literal "unlimited".
+//
+// Only a service may leave the ceiling open: a task that keeps failing has to
+// stop somewhere, while a service is meant to run forever and an attempt budget
+// spent over months of healthy uptime would retire it for no reason
+// (docs/SPEC.md §12).
+type Attempts int
+
+// Int returns the ceiling as a plain count. It is meaningless for an unlimited
+// policy, so callers check Unlimited first.
+func (a Attempts) Int() int { return int(a) }
+
+// Unlimited reports whether the policy has no attempt ceiling.
+func (a Attempts) Unlimited() bool { return a == AttemptsUnlimited }
+
+// String renders the ceiling as it is written in configuration.
+func (a Attempts) String() string {
+	if a.Unlimited() {
+		return unlimitedAttempts
+	}
+
+	return strconv.Itoa(int(a))
+}
+
+// ParseAttempts parses an attempt ceiling written as a count or as "unlimited".
+func ParseAttempts(raw string) (Attempts, error) {
+	if strings.TrimSpace(raw) == unlimitedAttempts {
+		return AttemptsUnlimited, nil
+	}
+
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("parsing attempts %q: %w", raw, err)
+	}
+
+	return Attempts(value), nil
+}
+
+// UnmarshalYAML decodes an attempt ceiling from a count or from "unlimited".
+//
+// The node is read as raw text rather than decoded into a string, so that both
+// the bare integer and the bare word are accepted without the operator having
+// to remember which one needs quoting.
+func (a *Attempts) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("decoding attempts: %q is not a scalar", node.Tag)
+	}
+
+	parsed, err := ParseAttempts(node.Value)
+	if err != nil {
+		return err
+	}
+
+	*a = parsed
+
+	return nil
+}
+
+// MarshalYAML encodes the ceiling back to its configured form.
+func (a Attempts) MarshalYAML() (any, error) { return a.String(), nil }
+
+// Bool returns a pointer to v. Configuration keys whose absence must stay
+// distinct from an explicit "false" are decoded into a *bool, and this is how
+// callers and tests supply one.
+func Bool(v bool) *bool { return &v }

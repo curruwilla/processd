@@ -30,7 +30,7 @@ func appendTo(t *testing.T, path, content string) {
 func writeStream(t *testing.T, store *Store, id string, attempt int, stream Stream, at time.Time, content string) {
 	t.Helper()
 
-	written, err := store.Create(id, attempt, at, 0)
+	written, err := store.Create(id, attempt, at, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}
@@ -182,7 +182,7 @@ func TestStore_TailBothStreamsAreLabelled(t *testing.T) {
 	store := New(t.TempDir(), 1<<20)
 	at := time.Now().UTC()
 
-	attempt, err := store.Create("proc_01K", 1, at, 0)
+	attempt, err := store.Create("proc_01K", 1, at, Policy{})
 	if err != nil {
 		t.Fatalf("Create() returned %v, want nil", err)
 	}

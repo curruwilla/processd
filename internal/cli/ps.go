@@ -14,6 +14,7 @@ import (
 type processRow struct {
 	ID       string `json:"id"`
 	Worker   string `json:"worker"`
+	Type     string `json:"type"`
 	Status   string `json:"status"`
 	PID      *int   `json:"pid"`
 	Attempt  int    `json:"attempt"`
@@ -78,12 +79,13 @@ func printProcessTable(cmd *cobra.Command, rows []processRow) {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "ID\tWORKER\tSTATUS\tPID\tATTEMPT\tEXIT")
+	fmt.Fprintln(w, "ID\tWORKER\tTYPE\tSTATUS\tPID\tATTEMPT\tEXIT")
 
 	for _, row := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			row.ID,
 			row.Worker,
+			row.Type,
 			row.Status,
 			formatOptionalInt(row.PID),
 			row.Attempt,

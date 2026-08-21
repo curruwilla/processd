@@ -3,6 +3,7 @@ package api
 import (
 	"time"
 
+	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/core"
 )
 
@@ -38,7 +39,7 @@ type processResponse struct {
 	Reason       core.Reason       `json:"reason,omitempty"`
 	PID          *int              `json:"pid"`
 	Attempt      int               `json:"attempt"`
-	MaxAttempts  int               `json:"max_attempts"`
+	MaxAttempts  *int              `json:"max_attempts"`
 	Command      string            `json:"command"`
 	Args         []string          `json:"args"`
 	Cwd          string            `json:"cwd"`
@@ -132,6 +133,17 @@ type logStreamEnd struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// attemptCeiling renders the attempt ceiling of an execution. A service that
+// restarts forever has none, and reporting that as a number would make the
+// sentinel the client's problem: null says it plainly.
+func attemptCeiling(maxAttempts int) *int {
+	if maxAttempts == config.AttemptsUnlimited {
+		return nil
+	}
+
+	return &maxAttempts
+}
+
 // newProcessResponse converts a domain execution into its API shape.
 func newProcessResponse(p *core.Process) processResponse {
 	resp := processResponse{
@@ -141,7 +153,7 @@ func newProcessResponse(p *core.Process) processResponse {
 		Status:       p.State,
 		Reason:       p.Reason,
 		Attempt:      p.Attempt,
-		MaxAttempts:  p.MaxAttempts,
+		MaxAttempts:  attemptCeiling(p.MaxAttempts),
 		Command:      p.Command,
 		Args:         p.Args,
 		Cwd:          p.Cwd,

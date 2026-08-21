@@ -75,8 +75,7 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	// The supervisor reads worker policy at attempt time and hands executions
 	// back to the scheduler when an attempt ends.
 	sup.SetWorkers(scheduler.Registry)
-	sup.SetOnFinish(scheduler.OnAttemptFinished)
-	sup.SetOnChange(scheduler.Notify)
+	sup.SetOnSettle(scheduler.OnExecutionSettled)
 
 	d := &Daemon{
 		cfg:        cfg,

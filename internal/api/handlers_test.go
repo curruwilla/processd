@@ -44,6 +44,18 @@ workers:
     args: ["-c", "echo one; sleep 0.4; echo two >&2"]
     cwd: /tmp
     kill_grace: 1s
+  - name: api
+    type: service
+    command: /bin/sleep
+    args: ["30"]
+    cwd: /tmp
+    kill_grace: 1s
+    overridable: [timeout]
+    retry:
+      backoff: {type: fixed, initial: 1s, max: 1s, jitter: 0}
+    logs:
+      rotate:
+        max_files: 2
 `
 
 // newLiveServer wires the real object graph: only the network is faked, so the
@@ -91,8 +103,7 @@ func newLiveServerWith(t *testing.T, tune func(*Options)) http.Handler {
 
 	sup.SetMetrics(observed)
 	sup.SetWorkers(scheduler.Registry)
-	sup.SetOnFinish(scheduler.OnAttemptFinished)
-	sup.SetOnChange(scheduler.Notify)
+	sup.SetOnSettle(scheduler.OnExecutionSettled)
 
 	t.Cleanup(func() {
 		_ = sup.Shutdown(t.Context(), time.Second)
@@ -320,5 +331,146 @@ func TestServer_processLogs_validation(t *testing.T) {
 				t.Errorf("GET logs%s returned %d, want %d", tt.query, got.Code, tt.want)
 			}
 		})
+	}
+}
+
+func TestServer_createProcess_service(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the worker decides the type", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api"}`, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST returned %d (%s), want 201", rec.Code, rec.Body.String())
+		}
+
+		created := decode[createProcessResponse](t, rec)
+		process := decode[processResponse](t, do(t, handler, http.MethodGet, "/v1/processes/"+created.ID, "", nil))
+
+		if process.Type != core.TypeService {
+			t.Errorf("type = %q, want %q", process.Type, core.TypeService)
+		}
+
+		// A service restarts for as long as it is meant to run, so there is no
+		// ceiling to report.
+		if process.MaxAttempts != nil {
+			t.Errorf("max_attempts = %v, want null for a service", *process.MaxAttempts)
+		}
+	})
+
+	t.Run("a task still reports its ceiling", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"1"}}`, nil)
+		created := decode[createProcessResponse](t, rec)
+		process := decode[processResponse](t, do(t, handler, http.MethodGet, "/v1/processes/"+created.ID, "", nil))
+
+		if process.MaxAttempts == nil || *process.MaxAttempts != 1 {
+			t.Errorf("max_attempts = %v, want 1", process.MaxAttempts)
+		}
+	})
+
+	t.Run("a request may not run a service as a task", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api","type":"task"}`, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST returned %d (%s), want 400", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("an unknown type is refused", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api","type":"daemon"}`, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST returned %d (%s), want 400", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a service has no timeout to override", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api","timeout":"30s"}`, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST returned %d (%s), want 400", rec.Code, rec.Body.String())
+		}
+
+		if body := decode[errorBody](t, rec); body.Error.Code != "timeout_denied" {
+			t.Errorf("error code = %q, want %q", body.Error.Code, "timeout_denied")
+		}
+	})
+
+	// A service takes a slot at admission or not at all, so a full node answers
+	// 503 instead of parking it in the queue (docs/SPEC.md §4).
+	t.Run("a full node refuses a service", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		for range 2 {
+			rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"sleeper"}`, nil)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST returned %d (%s), want 201", rec.Code, rec.Body.String())
+			}
+		}
+
+		rec := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api"}`, nil)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("POST returned %d (%s), want 503", rec.Code, rec.Body.String())
+		}
+
+		if body := decode[errorBody](t, rec); body.Error.Code != "no_capacity" {
+			t.Errorf("error code = %q, want %q", body.Error.Code, "no_capacity")
+		}
+	})
+
+	// Stopping a service is not the same as a service failing: it is told to
+	// stop and not to come back.
+	t.Run("delete stops it for good", func(t *testing.T) {
+		t.Parallel()
+
+		handler := newLiveServer(t)
+
+		created := decode[createProcessResponse](t,
+			do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"api"}`, nil))
+
+		if rec := do(t, handler, http.MethodDelete, "/v1/processes/"+created.ID, "", nil); rec.Code != http.StatusAccepted {
+			t.Fatalf("DELETE returned %d (%s), want 202", rec.Code, rec.Body.String())
+		}
+
+		stopped := awaitState(t, handler, created.ID)
+		if stopped.Status != core.StateCanceled || stopped.Reason != core.ReasonUserRequest {
+			t.Errorf("stopped service is %s/%s, want CANCELED/user_request", stopped.Status, stopped.Reason)
+		}
+	})
+}
+
+// A raw command is already the sharpest edge in the API; supervising one
+// forever with no worker definition bounding it is not an edge worth adding.
+func TestServer_createProcess_rawServiceDenied(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServerWith(t, func(opts *Options) {
+		opts.Config.ExecutionMode = config.ExecutionModeRaw
+		opts.Config.AllowedCommands = []string{"/bin/sleep"}
+	})
+
+	rec := do(t, handler, http.MethodPost, "/v1/processes",
+		`{"command":"/bin/sleep","args":["30"],"type":"service"}`, nil)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("POST returned %d (%s), want 403", rec.Code, rec.Body.String())
 	}
 }
