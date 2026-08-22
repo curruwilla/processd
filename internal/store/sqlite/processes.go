@@ -22,9 +22,29 @@ const processColumns = `id, worker, type, state, reason, attempt, max_attempts, 
 // terminalStates is the SQL fragment listing the states that never change again.
 const terminalStates = `('COMPLETED', 'FAILED', 'CANCELED')`
 
-// maxPendingBatch bounds one dispatch pass so a huge backlog cannot stall the
-// scheduler loop.
-const maxPendingBatch = 500
+const (
+	// maxPendingBatch bounds one dispatch pass so a huge backlog cannot stall the
+	// scheduler loop.
+	maxPendingBatch = 500
+
+	// maxPendingPerWorker bounds how much of that batch any single worker may
+	// occupy.
+	//
+	// The scheduler scans for eligible items rather than only the head, so that
+	// an item blocked by its lock or by its worker limit does not stall
+	// everything behind it (docs/SPEC.md §14.2). A plain oldest-first batch
+	// defeats that as soon as one worker's backlog is deeper than the batch:
+	// six hundred queued executions of a worker capped at two fill every row,
+	// and an execution submitted afterwards for an idle worker is never even
+	// looked at — not started, and not expired either, until the backlog ahead
+	// of it drains.
+	//
+	// The cap sits comfortably above the concurrency a single worker can take
+	// up in one pass on a default node, so bounding it costs nothing there; a
+	// node configured far above it fills over a few passes instead of one, and
+	// every settled execution wakes the loop anyway.
+	maxPendingPerWorker = 100
+)
 
 // CreateProcess persists a newly submitted execution.
 func (s *Store) CreateProcess(ctx context.Context, p *core.Process) error {
@@ -266,13 +286,23 @@ func (s *Store) ListProcesses(ctx context.Context, f store.Filter) (store.Page, 
 }
 
 // PendingProcesses returns the executions the scheduler may start now.
+//
+// The batch is oldest-first, but no single worker may take more than its share
+// of it: without that, the deepest backlog on the node hides every other
+// worker's work from the scheduler entirely. Within a worker the order is still
+// strictly the order they were submitted in, so the queue stays fair.
 func (s *Store) PendingProcesses(ctx context.Context, now time.Time) ([]*core.Process, error) {
-	query := `SELECT ` + processColumns + ` FROM processes
-		WHERE state = 'QUEUED'
-		   OR (state = 'RETRYING' AND (retry_at IS NULL OR retry_at <= ?))
+	query := `SELECT ` + processColumns + ` FROM (
+			SELECT ` + processColumns + `,
+			       ROW_NUMBER() OVER (PARTITION BY worker ORDER BY created_at ASC, id ASC) AS queue_position
+			FROM processes
+			WHERE state = 'QUEUED'
+			   OR (state = 'RETRYING' AND (retry_at IS NULL OR retry_at <= ?))
+		)
+		WHERE queue_position <= ?
 		ORDER BY created_at ASC, id ASC LIMIT ?`
 
-	return s.queryProcesses(ctx, query, formatTime(now), maxPendingBatch)
+	return s.queryProcesses(ctx, query, formatTime(now), maxPendingPerWorker, maxPendingBatch)
 }
 
 // UnfinishedProcesses returns the executions left in a non-terminal state.

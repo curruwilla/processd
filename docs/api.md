@@ -81,6 +81,13 @@ It is the client's key, and on a hub it is forwarded as sent rather than invente
 dispatch_unknown` means the hub stopped and the client is the one that retries, so the key has to be
 stable across those retries. See [Fleet](fleet.md#running-work-on-a-node).
 
+## Listing ranges
+
+`created_after` and `created_before` are RFC 3339 instants and are exclusive on both sides. They
+compare at full precision, so a bound written in whole seconds — `2026-08-22T10:00:00Z` — includes
+everything created during that second on the `created_after` side and excludes it on the
+`created_before` side.
+
 ---
 
 [Documentation index](README.md) · [CLI](cli.md) · [Lifecycle](lifecycle.md) ·

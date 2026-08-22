@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -233,6 +234,74 @@ func TestFleet_unreachableNodeKeepsItsLastSighting(t *testing.T) {
 	if status.Version != "v9.9.9" {
 		t.Errorf("version = %q, want the last known one", status.Version)
 	}
+}
+
+// A node that stops answering is one fact, and the poll repeats every few
+// seconds. Logging it per poll buries everything else: a node down for a day at
+// ten-second intervals is eight thousand copies of the same line.
+func TestFleet_logsReachabilityChangesOnly(t *testing.T) {
+	t.Parallel()
+
+	node := &fakeNode{}
+	server := node.server(t)
+
+	var lines countingHandler
+
+	f, _ := newFleet(t, "app-01", server.URL, "node-token")
+	f.log = slog.New(&lines)
+
+	f.pollAll(t.Context())
+
+	node.setDown(true)
+	f.pollAll(t.Context())
+
+	first := lines.count()
+	if first == 0 {
+		t.Fatal("the node going down was not logged at all")
+	}
+
+	// Three more polls with nothing new to say.
+	for range 3 {
+		f.pollAll(t.Context())
+	}
+
+	if got := lines.count(); got != first {
+		t.Errorf("a node that stayed down logged %d more lines, want none", got-first)
+	}
+
+	node.setDown(false)
+	f.pollAll(t.Context())
+
+	if lines.count() <= first {
+		t.Error("the node coming back was not logged, want the recovery reported")
+	}
+}
+
+// countingHandler counts the records a logger was asked to emit.
+type countingHandler struct {
+	mu      sync.Mutex
+	records int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(context.Context, slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.records++
+
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *countingHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.records
 }
 
 // Rotating a node's token takes effect on the next poll, not at the next

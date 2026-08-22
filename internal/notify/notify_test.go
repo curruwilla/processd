@@ -499,6 +499,69 @@ workers:
 
 // Sending on a closed queue would panic, and the supervisor keeps settling
 // executions while the daemon shuts down.
+// The daemon-wide fallback applies to every worker that declares no policy of
+// its own — including the worker it points at. Without a guard, a notification
+// worker that cannot run reports its own failure, which runs it again.
+func TestNotifier_DoesNotNotifyAboutANotification(t *testing.T) {
+	t.Parallel()
+
+	registry := registryFrom(t, `
+version: 1
+workers:
+  - name: invoice
+    command: /bin/echo
+  - name: alert
+    command: /bin/echo
+`)
+
+	submitter := &fakeSubmitter{}
+
+	n := New(Options{
+		Fallback: config.Notify{
+			On:   []config.NotifyEvent{config.NotifyOnFailed},
+			Exec: &config.NotifyExec{Worker: "alert"},
+		},
+		Workers: func() *config.Registry { return registry },
+		Submit:  submitter,
+		Node:    "node-1",
+		Logger:  quietLogger(),
+	})
+
+	stop := start(t, n)
+
+	alert, err := registry.Get("alert")
+	if err != nil {
+		t.Fatalf("Get() returned %v, want the worker", err)
+	}
+
+	// The notification worker itself fails, carrying the marker the notifier
+	// puts on everything it creates.
+	failed := failedProcess()
+	failed.Worker = "alert"
+	failed.Metadata = map[string]string{
+		triggerKey:      triggerNotify,
+		notifyEventKey:  string(config.NotifyOnFailed),
+		notifySourceKey: "proc_original",
+	}
+
+	n.Notify(config.NotifyOnFailed, failed, alert)
+
+	// An ordinary failure still reports, so the guard is about the marker and
+	// not about the worker.
+	n.Notify(config.NotifyOnFailed, failedProcess(), nil)
+
+	stop()
+
+	submitted := submitter.all()
+	if len(submitted) != 1 {
+		t.Fatalf("the notifier ran %d executions, want 1: %v", len(submitted), submitted)
+	}
+
+	if source := submitted[0].Metadata[notifySourceKey]; source != "proc_test" {
+		t.Errorf("the notification reports %q, want the ordinary failure", source)
+	}
+}
+
 func TestNotifier_NotifyAfterCloseIsSafe(t *testing.T) {
 	t.Parallel()
 

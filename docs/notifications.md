@@ -63,6 +63,11 @@ Rules that fail the load rather than the failure they were meant to report: the 
 any file), must be a `task`, must not declare `notify` of its own — a notifier that notifies about
 its own failure is a loop with no bound — and must not `require` a param outside that list.
 
+The same loop is closed at run time, where the load-time rule cannot see it: **an execution the
+notifier created never produces a notification of its own**. The daemon-wide policy applies to every
+worker that declares none, the target included, so without this a notification worker that cannot
+run would report its own failure — and run again, once per failure, for as long as the node is up.
+
 A complete target worker is
 [`examples/workers.d/notify-slack.yaml`](../examples/workers.d/notify-slack.yaml).
 

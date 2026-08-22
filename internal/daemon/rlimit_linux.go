@@ -67,7 +67,22 @@ func ensureFileLimit(maxProcesses int, log *slog.Logger) {
 			slog.Int("max_processes", maxProcesses),
 			slog.Uint64("limit", target),
 			slog.Uint64("needed", needed),
-			slog.Int("supported_processes", int((target-fdReserve)/fdsPerProcess)), //nolint:gosec // bounded by the limit
+			slog.Int("supported_processes", supportedProcesses(target)),
 		)
 	}
+}
+
+// supportedProcesses is how many executions a descriptor limit actually allows.
+//
+// The subtraction is guarded because the limit can be below the daemon's own
+// reserve — a container with a hard limit of 64, say. Unsigned arithmetic would
+// wrap there and print a number in the quintillions, in the one log line whose
+// whole job is to tell the operator how small the limit is.
+func supportedProcesses(limit uint64) int {
+	if limit <= fdReserve {
+		return 0
+	}
+
+	//nolint:gosec // bounded above by the descriptor limit
+	return int((limit - fdReserve) / fdsPerProcess)
 }

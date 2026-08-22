@@ -157,9 +157,21 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// timeLayout is the single format the schema stores, and it is RFC 3339 with a
+// fraction of fixed width.
+//
+// The width is the point. Timestamps are text here, and SQLite compares text
+// byte by byte, so the format has to sort the way the instants do.
+// time.RFC3339Nano does not: it strips trailing zeros, and a value with no
+// fraction ends in 'Z', which is greater than the '.' that begins one — making
+// 10:00:00.5 sort before 10:00:00. The visible cost is the range filters of
+// GET /v1/processes, where a client sends whole seconds and every execution
+// created during that second falls on the wrong side of the bound.
+const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
 // formatTime renders a timestamp in the single format the schema stores.
 func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(timeLayout)
 }
 
 // formatTimePtr renders an optional timestamp, or NULL.
@@ -171,6 +183,9 @@ func formatTimePtr(t *time.Time) any {
 	return formatTime(*t)
 }
 
+// parseTime reads a stored timestamp. It accepts any RFC 3339 fraction, not
+// only the fixed-width one written here: a row from before the normalising
+// migration is still a timestamp, it just did not sort.
 func parseTime(raw string) (time.Time, error) {
 	parsed, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {

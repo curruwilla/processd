@@ -282,6 +282,67 @@ func TestStore_PendingProcesses(t *testing.T) {
 	}
 }
 
+// The scheduler scans for eligible items rather than only the head, so that one
+// blocked item does not stall everything behind it. A plain oldest-first batch
+// defeats that: a backlog deeper than the batch hides every other worker's work
+// from the scheduler, which then neither starts it nor expires it.
+func TestStore_PendingProcesses_oneWorkerCannotFillTheBatch(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+	base := time.Now().UTC()
+
+	// A backlog deeper than the whole batch, submitted first.
+	for i := range maxPendingBatch + 100 {
+		p := newProcess(fmt.Sprintf("proc_deep_%04d", i), core.StateQueued)
+		p.Worker = "busy"
+		p.CreatedAt = base.Add(time.Duration(i) * time.Millisecond)
+
+		if err := db.CreateProcess(ctx, p); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+	}
+
+	behind := newProcess("proc_behind", core.StateQueued)
+	behind.Worker = "idle"
+	behind.CreatedAt = base.Add(time.Hour)
+
+	if err := db.CreateProcess(ctx, behind); err != nil {
+		t.Fatalf("CreateProcess() returned %v, want nil", err)
+	}
+
+	pending, err := db.PendingProcesses(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("PendingProcesses() returned %v, want nil", err)
+	}
+
+	perWorker := map[string]int{}
+	seen := false
+
+	for _, p := range pending {
+		perWorker[p.Worker]++
+
+		if p.ID == "proc_behind" {
+			seen = true
+		}
+	}
+
+	if !seen {
+		t.Errorf("the batch holds %d rows, %v by worker, and none of them is the work queued behind the backlog",
+			len(pending), perWorker)
+	}
+
+	if perWorker["busy"] > maxPendingPerWorker {
+		t.Errorf("one worker took %d of the batch, want at most %d", perWorker["busy"], maxPendingPerWorker)
+	}
+
+	// Within a worker the order is still strictly submission order.
+	if len(pending) > 1 && pending[0].ID != "proc_deep_0000" {
+		t.Errorf("the batch starts at %s, want the oldest queued execution", pending[0].ID)
+	}
+}
+
 func TestStore_UnfinishedProcesses(t *testing.T) {
 	t.Parallel()
 
@@ -335,6 +396,70 @@ func TestStore_CountByState(t *testing.T) {
 		t.Errorf("counts = %v, want 3 queued and 1 running", counts)
 	}
 }
+
+// The range filters are where a non-sorting timestamp shows: a client sends
+// whole seconds, and every execution created during that second has a fraction
+// the bound does not.
+func TestStore_ListProcesses_rangeBoundary(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	second := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+
+	within := newProcess("proc_within", core.StateCompleted)
+	within.CreatedAt = second.Add(500 * time.Millisecond)
+
+	if err := db.CreateProcess(ctx, within); err != nil {
+		t.Fatalf("CreateProcess() returned %v, want nil", err)
+	}
+
+	tests := []struct {
+		name   string
+		filter store.Filter
+		want   int
+	}{
+		{
+			name:   "the boundary second is after the bound below it",
+			filter: store.Filter{CreatedAfter: &second},
+			want:   1,
+		},
+		{
+			name:   "and before the bound above it",
+			filter: store.Filter{CreatedBefore: ptr(second.Add(time.Second))},
+			want:   1,
+		},
+		{
+			name:   "it is not after the next second",
+			filter: store.Filter{CreatedAfter: ptr(second.Add(time.Second))},
+			want:   0,
+		},
+		{
+			name:   "nor before its own",
+			filter: store.Filter{CreatedBefore: &second},
+			want:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			page, err := db.ListProcesses(ctx, tt.filter)
+			if err != nil {
+				t.Fatalf("ListProcesses() returned %v, want nil", err)
+			}
+
+			if len(page.Items) != tt.want {
+				t.Errorf("listing returned %d rows, want %d (created_at %s)",
+					len(page.Items), tt.want, formatTime(within.CreatedAt))
+			}
+		})
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
 
 func TestStore_PurgeHistory(t *testing.T) {
 	t.Parallel()
@@ -392,10 +517,15 @@ func TestStore_PurgeHistory_takesTheIdempotencyKeysWithIt(t *testing.T) {
 	stale.CreatedAt = old
 	stale.FinishedAt = &old
 
+	// Old enough to be past the claim grace, recent enough to survive the age
+	// cutoff: it is the row limit that removes it, and its key with it.
 	trimmed := newProcess("proc_trimmed", core.StateCompleted)
+	trimmed.CreatedAt = time.Now().UTC().Add(-5 * time.Minute)
+
 	kept := newProcess("proc_kept", core.StateCompleted)
 	kept.CreatedAt = time.Now().UTC().Add(time.Second)
 
+	// A key is written with its execution, so it carries the same age.
 	for _, p := range []*core.Process{stale, trimmed, kept} {
 		if err := db.CreateProcess(ctx, p); err != nil {
 			t.Fatalf("CreateProcess() returned %v, want nil", err)
@@ -405,12 +535,26 @@ func TestStore_PurgeHistory_takesTheIdempotencyKeysWithIt(t *testing.T) {
 			Key:         "key-" + p.ID,
 			RequestHash: "hash",
 			ProcessID:   p.ID,
-			CreatedAt:   time.Now().UTC(),
+			CreatedAt:   p.CreatedAt,
 		}
 
 		if err := db.SaveIdempotency(ctx, record); err != nil {
 			t.Fatalf("SaveIdempotency() returned %v, want nil", err)
 		}
+	}
+
+	// A claim is written just before the execution it points at, so between the
+	// two writes it legitimately points at nothing. Collecting it there would
+	// let the client retry it was taken for start the work a second time.
+	inFlight := store.Idempotency{
+		Key:         "key-in-flight",
+		RequestHash: "hash",
+		ProcessID:   "proc_not_created_yet",
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	if err := db.SaveIdempotency(ctx, inFlight); err != nil {
+		t.Fatalf("SaveIdempotency() returned %v, want nil", err)
 	}
 
 	// The age cutoff takes the stale one; the row limit takes the other.
@@ -426,6 +570,10 @@ func TestStore_PurgeHistory_takesTheIdempotencyKeysWithIt(t *testing.T) {
 
 	if _, err := db.FindIdempotency(ctx, "key-proc_kept"); err != nil {
 		t.Errorf("FindIdempotency() returned %v, want the key of a retained execution kept", err)
+	}
+
+	if _, err := db.FindIdempotency(ctx, "key-in-flight"); err != nil {
+		t.Errorf("FindIdempotency() returned %v, want a claim still on its way to a process kept", err)
 	}
 }
 

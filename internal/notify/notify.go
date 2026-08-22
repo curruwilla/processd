@@ -136,6 +136,18 @@ func New(opts Options) *Notifier {
 // path that records what an execution did, and nothing about telling somebody
 // may delay or change that.
 func (n *Notifier) Notify(event config.NotifyEvent, p *core.Process, worker *config.Worker) {
+	// Nothing is reported about a notification, which is the loop the loader
+	// refuses when a worker declares one: the worker that reports a failure
+	// fails, and reports that.
+	//
+	// The load-time check only sees a worker's own policy, and the daemon-wide
+	// fallback applies to every worker that declares none — including the one it
+	// points at. A notification worker that cannot run would otherwise notify
+	// about itself, once per failure, for as long as the node is up.
+	if p == nil || p.Metadata[triggerKey] == triggerNotify {
+		return
+	}
+
 	policy := n.policyFor(worker)
 	if !policy.Notifies(event) {
 		return

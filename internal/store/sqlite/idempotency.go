@@ -87,6 +87,15 @@ func (s *Store) FindIdempotency(ctx context.Context, key string) (store.Idempote
 	return record, nil
 }
 
+// claimGrace is how long a key is left alone before it may be read as an
+// orphan.
+//
+// A claim is written just *before* the execution it points at, so between the
+// two writes it legitimately points at nothing. A retention pass landing in
+// that gap would delete a claim that is about to become valid, and the client
+// retry it was taken for would then start the work a second time.
+const claimGrace = time.Minute
+
 // purgeIdempotency removes the keys that can no longer replay anything: those
 // past the retention window, and those whose execution has already been purged
 // by the row limit.
@@ -96,9 +105,12 @@ func (s *Store) FindIdempotency(ctx context.Context, key string) (store.Idempote
 // unknown — for a request it may safely repeat. The caller holds writeMu.
 func (s *Store) purgeIdempotency(ctx context.Context, before time.Time) error {
 	const query = `DELETE FROM idempotency_keys
-		WHERE created_at < ? OR process_id NOT IN (SELECT id FROM processes)`
+		WHERE created_at < ?
+		   OR (created_at < ? AND process_id NOT IN (SELECT id FROM processes))`
 
-	if _, err := s.db.ExecContext(ctx, query, formatTime(before)); err != nil {
+	settled := time.Now().UTC().Add(-claimGrace)
+
+	if _, err := s.db.ExecContext(ctx, query, formatTime(before), formatTime(settled)); err != nil {
 		return fmt.Errorf("purging idempotency keys: %w", err)
 	}
 

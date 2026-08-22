@@ -246,9 +246,10 @@ func (f *Fleet) poll(ctx context.Context, n *node) {
 // record stores a poll result, keeping the last successful sighting.
 func (f *Fleet) record(status Status) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
-	if previous, ok := f.status[status.Name]; ok && status.LastSeen == nil {
+	previous, known := f.status[status.Name]
+
+	if known && status.LastSeen == nil {
 		status.LastSeen = previous.LastSeen
 		status.Version = previous.Version
 		status.Stats = previous.Stats
@@ -256,9 +257,24 @@ func (f *Fleet) record(status Status) {
 
 	f.status[status.Name] = status
 
+	f.mu.Unlock()
+
+	// Logged when the answer changes, not on every poll. A node that is down for
+	// a day at a ten-second interval is one fact, and eight thousand copies of
+	// it bury everything else in the log.
+	if known && previous.Reachable == status.Reachable {
+		return
+	}
+
 	if !status.Reachable {
 		f.log.Warn("fleet node is unreachable",
 			slog.String("node", status.Name), slog.String("error", status.Error))
+
+		return
+	}
+
+	if known {
+		f.log.Info("fleet node is answering again", slog.String("node", status.Name))
 	}
 }
 

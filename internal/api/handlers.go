@@ -235,9 +235,13 @@ func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.scheduler.Submit(r.Context(), process); err != nil {
-		// Nothing ran, so the key must not stay claimed: a queue that was full a
-		// moment ago is a reason to repeat the request, not to refuse it forever.
-		s.releaseIdempotent(r, key, process.ID)
+		if refused(err) {
+			// Nothing ran and nothing will, so the key must not stay claimed: a
+			// queue that was full a moment ago is a reason to repeat the request,
+			// not to refuse it for as long as the history is kept.
+			s.releaseIdempotent(r, key, process.ID)
+		}
+
 		writeError(w, s.log, err)
 
 		return
@@ -661,6 +665,20 @@ func (s *Server) claimIdempotent(r *http.Request, key string, body []byte, proce
 	}
 
 	return replayed, nil
+}
+
+// refused reports whether a submission failed in a way that settles the
+// question: the execution was either never recorded, or recorded as refused.
+//
+// Anything else — a store that would not answer, most of all — leaves a row
+// behind that the next start reconciles and may still run. Freeing the key
+// there would let a client retry produce a second execution of work that is
+// already on its way.
+func refused(err error) bool {
+	return errors.Is(err, core.ErrQueueFull) ||
+		errors.Is(err, core.ErrShuttingDown) ||
+		errors.Is(err, core.ErrNoCapacity) ||
+		errors.Is(err, core.ErrLockHeld)
 }
 
 // releaseIdempotent gives a claim back when the work it was taken for never

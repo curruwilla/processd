@@ -80,6 +80,15 @@ signal are recorded **per attempt** — see [Monitoring](monitoring.md#execution
 
 The persisted state is the source of truth; in-memory state is a cache rebuilt on startup.
 
+## How the queue is drained
+
+Queued work is scanned for what can start, not just read from the head: an execution blocked by its
+lock or by its worker's `max_processes` must not stall everything behind it. Each pass reads a
+bounded batch, and no single worker may fill that batch on its own — otherwise the deepest backlog on
+the node would hide every other worker's work, which would then be neither started nor expired until
+that backlog drained. Within one worker the order is strictly the order the executions were submitted
+in.
+
 ## Services and the queue
 
 A service never sits in the queue: it takes its slot at admission or is refused with `no_capacity`,
