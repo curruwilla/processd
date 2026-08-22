@@ -60,6 +60,8 @@ attempt `log_truncated`. Retention (`logs.retention`) belongs to the daemon, rot
 (`logs.rotate.max_files`) to the worker — and rotation is mandatory on a service, whose single
 attempt can run long enough to fill the cap and then go silent.
 
+Retention never collects an attempt that is still writing, however old its last line is.
+
 ## Web console
 
 <http://127.0.0.1:7373/ui/> — node dashboard, filtered executions, live CPU and memory, streaming

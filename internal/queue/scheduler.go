@@ -123,6 +123,8 @@ func (s *Scheduler) admit(ctx context.Context, p *core.Process) error {
 
 	// A worker configured to reject on lock conflicts must answer immediately
 	// rather than sit in the queue, so the lock is claimed before the slot.
+	claimed := false
+
 	if p.Lock != "" && lockConflict(worker) == config.LockConflictReject {
 		if err := s.store.AcquireLock(ctx, p.Lock, p.ID); err != nil {
 			if errors.Is(err, core.ErrLockHeld) {
@@ -131,9 +133,20 @@ func (s *Scheduler) admit(ctx context.Context, p *core.Process) error {
 
 			return err
 		}
+
+		claimed = true
 	}
 
 	if !s.slots.TryAcquire(p.ID, p.Worker) {
+		// A lock belongs to a running attempt, never to a place in line. Keeping
+		// the one claimed a moment ago would make every later submission answer
+		// 409 against an execution that is not running, and for as long as the
+		// node stays full. The dispatch pass claims it again when a slot frees
+		// up, and by then it means what it says.
+		if claimed {
+			s.releaseLock(ctx, p)
+		}
+
 		return s.park(ctx, p, fmt.Errorf("%d of %d slots in use: %w", used(s.slots), s.cfg.MaxProcesses, core.ErrNoCapacity))
 	}
 
@@ -239,7 +252,12 @@ func (s *Scheduler) launch(ctx context.Context, p *core.Process) error {
 // leaks a slot or a lock.
 func (s *Scheduler) releaseAll(ctx context.Context, p *core.Process) {
 	s.slots.Release(p.ID)
+	s.releaseLock(ctx, p)
+}
 
+// releaseLock frees the lock an execution holds, reporting a failure rather
+// than returning it: the caller is already on its way somewhere else.
+func (s *Scheduler) releaseLock(ctx context.Context, p *core.Process) {
 	if err := s.store.ReleaseLock(ctx, p.Lock, p.ID); err != nil {
 		s.log.Error("releasing lock", slog.String("process", p.ID), slog.Any("error", err))
 	}
@@ -375,9 +393,7 @@ func (s *Scheduler) expire(ctx context.Context, p *core.Process) bool {
 		return false
 	}
 
-	if err := s.store.ReleaseLock(ctx, p.Lock, p.ID); err != nil {
-		s.log.Error("releasing lock", slog.String("process", p.ID), slog.Any("error", err))
-	}
+	s.releaseLock(ctx, p)
 
 	if err := s.store.UpdateProcess(ctx, p); err != nil {
 		s.log.Error("expiring queued execution", slog.String("process", p.ID), slog.Any("error", err))

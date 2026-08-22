@@ -10,6 +10,12 @@ import (
 
 // Stop terminates an execution gracefully, escalating to SIGKILL after grace.
 // A user-requested stop never triggers a retry.
+//
+// It returns as soon as the intent is recorded: the grace period belongs to the
+// process, not to the request, so waiting it out here would make the answer
+// take as long as the process takes to die, and a client that gave up on that
+// answer would cancel the very wait it asked for. The outcome arrives in the
+// store, which is what a caller polls.
 func (s *Supervisor) Stop(ctx context.Context, id string, grace time.Duration) error {
 	exec := s.lookup(id)
 	if exec != nil {
@@ -22,7 +28,14 @@ func (s *Supervisor) Stop(ctx context.Context, id string, grace time.Duration) e
 			grace = exec.grace
 		}
 
-		s.beginStop(ctx, exec, core.ReasonUserRequest, grace)
+		// Detached deliberately: a cancelled context tells the runner to give up
+		// waiting and escalate, so inheriting the request's would turn a client
+		// hanging up into an immediate SIGKILL.
+		stopping := context.WithoutCancel(ctx)
+
+		// The supervision goroutine of this attempt cannot finish until the
+		// process does, so a shutdown already waits for whatever this starts.
+		go s.beginStop(stopping, exec, core.ReasonUserRequest, grace)
 
 		return nil
 	}

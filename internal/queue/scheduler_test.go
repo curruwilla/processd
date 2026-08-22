@@ -267,6 +267,60 @@ func TestScheduler_Submit_locks(t *testing.T) {
 			t.Errorf("rejected execution is %s/%s, want CANCELED/lock_conflict", stored.State, stored.Reason)
 		}
 	})
+
+	// A rejecting worker claims its lock before its slot, so that a conflict is
+	// answered instead of queued. When it is the slot that is missing, the claim
+	// has to be given back: a lock belongs to a running attempt, and one held by
+	// something merely waiting in line refuses every later submission for as
+	// long as the node stays full.
+	t.Run("a rejecting worker gives the lock back when it only gets queued", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, db, starter := newScheduler(t, nil)
+		ctx := t.Context()
+
+		for _, id := range []string{"proc_fill1", "proc_fill2"} {
+			if err := scheduler.Submit(ctx, newSubmission(id, "invoice", "")); err != nil {
+				t.Fatalf("filling the slots returned %v, want nil", err)
+			}
+		}
+
+		if err := scheduler.Submit(ctx, newSubmission("proc_waiting", "exclusive", "batch")); err != nil {
+			t.Fatalf("Submit() returned %v, want nil", err)
+		}
+
+		queued, err := db.GetProcess(ctx, "proc_waiting")
+		if err != nil {
+			t.Fatalf("GetProcess() returned %v, want nil", err)
+		}
+
+		if queued.State != core.StateQueued {
+			t.Fatalf("execution is %s, want %s", queued.State, core.StateQueued)
+		}
+
+		locks, err := db.ActiveLocks(ctx)
+		if err != nil {
+			t.Fatalf("ActiveLocks() returned %v, want nil", err)
+		}
+
+		if holder, held := locks["batch"]; held {
+			t.Errorf("lock %q is held by %s while it is only queued, want it free", "batch", holder)
+		}
+
+		// The proof that it is free: the next submission is admitted rather than
+		// refused against an execution that is not running.
+		if err := scheduler.Submit(ctx, newSubmission("proc_next", "exclusive", "batch")); err != nil {
+			t.Fatalf("Submit() of the next execution returned %v, want nil", err)
+		}
+
+		if next, _ := db.GetProcess(ctx, "proc_next"); next.State == core.StateCanceled {
+			t.Errorf("the next execution is %s/%s, want it queued rather than refused", next.State, next.Reason)
+		}
+
+		if starter.count() != 2 {
+			t.Errorf("starter ran %d executions, want the 2 that filled the slots", starter.count())
+		}
+	})
 }
 
 func TestScheduler_dispatch(t *testing.T) {

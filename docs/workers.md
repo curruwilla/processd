@@ -110,6 +110,10 @@ serialises invoice 42 against itself while leaving invoice 43 alone. `lock_confl
 second execution does while the key is held — `queue` waits its turn, `reject` answers `409`
 immediately and records nothing.
 
+A lock belongs to a running attempt, never to a place in line: an execution waiting for a slot holds
+none, whatever its `lock_conflict` says, and claims it when the scheduler starts it. `reject` answers
+`409` against work that is actually running, not against work that is queued behind a full node.
+
 The lock is held across a retry: releasing it during the backoff would let another execution take it
 mid-retry.
 

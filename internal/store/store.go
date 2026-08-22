@@ -120,9 +120,15 @@ type Store interface {
 	// ActiveLocks rebuilds the lock table view after a restart.
 	ActiveLocks(ctx context.Context) (map[string]string, error)
 
+	// SaveIdempotency claims a key for an execution, reporting
+	// core.ErrIdempotencyClaimed when another request took it first. The claim
+	// is taken before the work starts, so two copies of the same request cannot
+	// both run it.
 	SaveIdempotency(ctx context.Context, record Idempotency) error
 	// FindIdempotency returns a stored key, or core.ErrNotFound.
 	FindIdempotency(ctx context.Context, key string) (Idempotency, error)
+	// DeleteIdempotency releases a claim whose execution never started.
+	DeleteIdempotency(ctx context.Context, key, processID string) error
 
 	// LoadSchedules returns the persisted state of every worker schedule. It is
 	// read at startup and after a reload, never on the firing path.

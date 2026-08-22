@@ -155,8 +155,10 @@ func (s *Schedule) String() string { return s.spec + " " + s.loc.String() }
 //     them by keying on the local time (docs/SPEC.md §22.1).
 func (s *Schedule) Next(t time.Time) (time.Time, bool) {
 	// Start from the top of the next minute: a schedule fires on a minute
-	// boundary, and the caller's clock rarely sits on one.
-	current := t.In(s.loc).Truncate(time.Minute).Add(time.Minute)
+	// boundary, and the caller's clock rarely sits on one. Like every other
+	// step here, the boundary is a wall-clock one, rebuilt from the fields
+	// rather than rounded on the absolute clock.
+	current := startOfNextMinute(t.In(s.loc))
 	limit := current.Add(horizon)
 
 	for {
@@ -240,8 +242,19 @@ func startOfNextDay(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location()).AddDate(0, 0, 1)
 }
 
+func startOfNextMinute(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, t.Location()).Add(time.Minute)
+}
+
+// startOfNextHour returns the top of the following hour, in wall-clock terms.
+//
+// Truncate would round to an absolute hour boundary instead, which is the same
+// instant only in zones whose offset is a whole number of hours. In a zone
+// offset by :30 or :45 it lands mid-hour, and every hour-restricted expression
+// then skips the first half of the hour it was looking for — "0 11 * * *" in
+// Asia/Kolkata would never match at all.
 func startOfNextHour(t time.Time) time.Time {
-	return t.Truncate(time.Hour).Add(time.Hour)
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location()).Add(time.Hour)
 }
 
 // parseField compiles one comma-separated field into a bitmask.

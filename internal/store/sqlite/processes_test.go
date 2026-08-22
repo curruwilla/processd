@@ -377,6 +377,58 @@ func TestStore_PurgeHistory(t *testing.T) {
 	}
 }
 
+// An idempotency key replays an execution, so it is worth exactly as long as
+// that execution is retained. One that outlives it is worse than one that is
+// gone: the replay finds nothing and the client is told its own key is unknown.
+func TestStore_PurgeHistory_takesTheIdempotencyKeysWithIt(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	old := time.Now().UTC().Add(-48 * time.Hour)
+
+	stale := newProcess("proc_stale", core.StateCompleted)
+	stale.CreatedAt = old
+	stale.FinishedAt = &old
+
+	trimmed := newProcess("proc_trimmed", core.StateCompleted)
+	kept := newProcess("proc_kept", core.StateCompleted)
+	kept.CreatedAt = time.Now().UTC().Add(time.Second)
+
+	for _, p := range []*core.Process{stale, trimmed, kept} {
+		if err := db.CreateProcess(ctx, p); err != nil {
+			t.Fatalf("CreateProcess() returned %v, want nil", err)
+		}
+
+		record := store.Idempotency{
+			Key:         "key-" + p.ID,
+			RequestHash: "hash",
+			ProcessID:   p.ID,
+			CreatedAt:   time.Now().UTC(),
+		}
+
+		if err := db.SaveIdempotency(ctx, record); err != nil {
+			t.Fatalf("SaveIdempotency() returned %v, want nil", err)
+		}
+	}
+
+	// The age cutoff takes the stale one; the row limit takes the other.
+	if _, err := db.PurgeHistory(ctx, time.Now().UTC().Add(-24*time.Hour), 1); err != nil {
+		t.Fatalf("PurgeHistory() returned %v, want nil", err)
+	}
+
+	for _, purged := range []string{"key-proc_stale", "key-proc_trimmed"} {
+		if _, err := db.FindIdempotency(ctx, purged); !errors.Is(err, core.ErrNotFound) {
+			t.Errorf("FindIdempotency(%q) returned %v, want core.ErrNotFound", purged, err)
+		}
+	}
+
+	if _, err := db.FindIdempotency(ctx, "key-proc_kept"); err != nil {
+		t.Errorf("FindIdempotency() returned %v, want the key of a retained execution kept", err)
+	}
+}
+
 func TestStore_PurgeHistory_trimsToMaxRows(t *testing.T) {
 	t.Parallel()
 

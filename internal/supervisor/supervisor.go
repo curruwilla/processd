@@ -197,11 +197,11 @@ func (s *Supervisor) Start(ctx context.Context, caller *core.Process) error {
 	p.StartedAt = &startedAt
 
 	if err := p.TransitionTo(core.StateRunning, ""); err != nil {
-		return err
+		return s.abandonStart(ctx, p, worker, attemptLogs, handle, err)
 	}
 
 	if err := s.store.UpdateProcess(ctx, p); err != nil {
-		return err
+		return s.abandonStart(ctx, p, worker, attemptLogs, handle, err)
 	}
 
 	exec := &execution{
@@ -233,6 +233,61 @@ func (s *Supervisor) Start(ctx context.Context, caller *core.Process) error {
 	go s.supervise(exec)
 
 	return nil
+}
+
+// abandonStart terminates an attempt that ran but could not be taken under
+// supervision, and records it as a start failure.
+//
+// The process exists by this point, and everything that would let anything
+// reach it again has failed: no goroutine is waiting on it, its id maps to
+// nothing, and the caller is about to hand its slot to somebody else. Leaving
+// it alive is how a node ends up running past max_processes with no way to see
+// it, so the group is stopped and reaped here.
+//
+// The likeliest cause is a store write refused because the request that
+// submitted the work went away, so nothing here uses the caller's context.
+func (s *Supervisor) abandonStart(
+	ctx context.Context,
+	p *core.Process,
+	worker *config.Worker,
+	logs *logstore.Attempt,
+	handle *runner.Handle,
+	cause error,
+) error {
+	detached := context.WithoutCancel(ctx)
+
+	// Nothing else will reap this child, and an unwaited one stays a signalable
+	// zombie — which is also what would keep Stop waiting out the whole grace
+	// instead of returning as soon as the process is gone.
+	reaped := make(chan struct{})
+
+	go func() {
+		defer close(reaped)
+
+		if _, err := s.runner.Wait(detached, handle); err != nil {
+			s.log.Debug("reaping an unsupervised attempt",
+				slog.String("process", p.ID), slog.Any("error", err))
+		}
+	}()
+
+	if err := s.runner.Stop(detached, handle, killGrace(worker)); err != nil {
+		s.log.Error("stopping an attempt that could not be supervised",
+			slog.String("process", p.ID), slog.Int("pid", handle.PID), slog.Any("error", err))
+	}
+
+	<-reaped
+
+	if err := logs.Close(); err != nil {
+		s.log.Error("closing attempt logs", slog.String("process", p.ID), slog.Any("error", err))
+	}
+
+	// It never became a supervised attempt, so it is reported as one that never
+	// started: the same outcome, and the retry policy still applies to it.
+	p.PID = 0
+	p.PIDStartTime = 0
+	p.StartedAt = nil
+
+	return s.startFailed(detached, p, worker, cause)
 }
 
 // startFailed records an attempt that never became a process.
@@ -452,6 +507,13 @@ func exitTrigger(kind core.Type, result runner.Result) config.RetryTrigger {
 func (s *Supervisor) classifyShutdown(ctx context.Context, p *core.Process, policy config.Retry) {
 	if policy.IsEnabled() && policy.OnShutdown {
 		s.transition(p, core.StateQueued, core.ReasonShutdown)
+
+		// The wait starts now. queue.item_ttl measures how long an execution has
+		// been in line, and leaving the old stamp would date the wait from the
+		// original submission: a task that ran for longer than the TTL would be
+		// expired by the next daemon start for having waited no time at all.
+		queuedAt := time.Now().UTC()
+		p.QueuedAt = &queuedAt
 
 		return
 	}

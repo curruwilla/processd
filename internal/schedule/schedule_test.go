@@ -250,6 +250,83 @@ func TestRunner_RecordsMissedOccurrencesWithoutRunningThem(t *testing.T) {
 	}
 }
 
+// A restart is not a new outage. Counting downtime from the last firing alone
+// would report the same window again on every start before the schedule next
+// fires, and the number an operator reads would grow with how often the daemon
+// was restarted rather than with how much did not run.
+func TestRunner_CountsAMissedWindowOnce(t *testing.T) {
+	t.Parallel()
+
+	runner, _, db := newRunner(t, dailyWorker)
+
+	lastFired := time.Date(2026, 8, 16, 3, 0, 0, 0, time.UTC)
+	if err := db.SaveSchedule(t.Context(), store.ScheduleState{Worker: "invoice", LastFiredAt: &lastFired}); err != nil {
+		t.Fatalf("seeding schedule state: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+
+	for restart := 1; restart <= 3; restart++ {
+		runner.reset(t.Context(), now)
+
+		status, _ := runner.Status("invoice")
+		if status.MissedRuns != 4 {
+			t.Fatalf("after restart %d MissedRuns = %d, want 4", restart, status.MissedRuns)
+		}
+	}
+
+	// A later restart accounts for what passed since, and only that.
+	later := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	runner.reset(t.Context(), later)
+
+	status, _ := runner.Status("invoice")
+	if status.MissedRuns != 6 {
+		t.Errorf("MissedRuns = %d, want 6: the two occurrences since the last pass", status.MissedRuns)
+	}
+}
+
+// Status is read by the API from its own goroutines while the firing loop keeps
+// moving the plan forward.
+func TestRunner_StatusIsSafeWhileTheLoopAdvances(t *testing.T) {
+	t.Parallel()
+
+	runner, _, _ := newRunner(t, `
+version: 1
+workers:
+  - name: invoice
+    command: /bin/echo
+    cwd: /tmp
+    schedule:
+      cron: "* * * * *"
+`)
+
+	base := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	runner.reset(t.Context(), base)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				runner.Status("invoice")
+			}
+		}
+	}()
+
+	for i := range 200 {
+		runner.fireDue(t.Context(), base.Add(time.Duration(i+2)*time.Minute))
+	}
+
+	close(stop)
+	<-done
+}
+
 func TestRunner_CatchUpRunsTheLastMissedOccurrenceOnce(t *testing.T) {
 	t.Parallel()
 

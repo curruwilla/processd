@@ -29,7 +29,7 @@ export PROCESSD_TOKEN=...
 | `processd ps [--status S] [--type task\|service] [--worker w] [--node n\|*] [--limit n] [--cursor c] [--output table\|json]` | lists executions; `--node` reads a [fleet](fleet.md) node instead of this one |
 | `processd run <worker> [--param name=value] [--lock k] [--node n]` | creates an execution; `--node` runs it on that fleet node |
 | `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f] [--node n]` | captured output, `-f` streams it |
-| `processd stop <id> [--grace 15s] [--node n]` | `SIGTERM` to the group, `SIGKILL` after the grace |
+| `processd stop <id> [--grace 15s] [--node n]` | `SIGTERM` to the group, `SIGKILL` after the grace. It returns as soon as the daemon accepts the stop; the grace runs on the node, so interrupting the command does not cut it short. `processd ps` shows the outcome |
 | `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m] [--node n]` | stops it and creates a new execution from the current worker definition |
 | `processd signal <id> <SIGNAL> [--node n]` | sends an allowlisted signal to the group |
 | `processd workers` | loaded workers, with their declared params, cron expression and next run |

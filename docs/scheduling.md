@@ -67,6 +67,10 @@ Arithmetic, not a special case, and the two directions differ on purpose:
 * *Fall back* — the repeated hour would hand the same local time to two instants, so the second is
   skipped. `03:00 daily` means one firing that day.
 
+Wall-clock arithmetic is the rule for every step of the search, not only the ones that cross a DST
+boundary, so zones offset by half an hour or three quarters of one — `Asia/Kolkata`, `Asia/Kathmandu`,
+`Australia/Adelaide`, `America/St_Johns` — read an expression exactly like any other zone.
+
 ## What a firing carries
 
 The execution is created from the current worker definition with no params beyond their defaults, and
@@ -82,6 +86,9 @@ processd workers
 
 `processd workers` and `GET /v1/workers` report `next_run`, `last_fired_at`, `last_missed_at` and
 `missed_runs`. A schedule whose next firing nobody can see is the crontab entry this replaced.
+
+`missed_runs` counts occurrences, not restarts: a window is accounted for once, so restarting the
+daemon three times after an outage reports what did not run, not three times what did not run.
 
 ---
 

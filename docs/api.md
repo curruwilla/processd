@@ -21,7 +21,7 @@ curl -X POST http://127.0.0.1:7373/v1/processes \
 | `POST /v1/processes` | `{"worker":"...","params":{...}}`. `201` admitted, `202` queued. An optional `Idempotency-Key` replays the original response with `Idempotent-Replay: true` for as long as that execution is retained; the same key with a different body → `409`. On a hub, an optional `node` dispatches it there instead |
 | `GET /v1/processes` | filters: `status` (repeatable), `type`, `worker`, `lock`, `created_after`, `created_before`; `limit` default 50, max 500; cursor paging |
 | `GET /v1/processes/{id}` | full representation, including live CPU and memory while it runs |
-| `DELETE /v1/processes/{id}?grace=15s` | `CANCELED` with `reason: user_request`, and **never** triggers a retry |
+| `DELETE /v1/processes/{id}?grace=15s` | `202`, and the stop runs on its own: the grace belongs to the process, not to the request, so the answer does not wait it out and hanging up does not cut it short. Ends as `CANCELED` with `reason: user_request`, and **never** triggers a retry |
 | `POST /v1/processes/{id}/signal` | `{"signal":"SIGUSR1"}` — the allowlist is in [CLI → Signals](cli.md#signals) |
 | `GET /v1/processes/{id}/logs` | `?stream=stdout\|stderr\|both&attempt=N&tail=N` |
 | `GET /v1/processes/{id}/logs/stream` | Server-Sent Events, one `line` event per line, `end` when the attempt finishes |
@@ -52,10 +52,10 @@ Errors always look the same:
 
 | Status | When |
 |---|---|
-| `400` | invalid payload, invalid or undeclared param, unsupported `type`, signal outside the allowlist |
+| `400` | invalid payload, invalid or undeclared param, unsupported `type`, signal outside the allowlist, or a raw `command` sent together with `worker`, `params` or `timeout` — those belong to a worker, and a raw command has none |
 | `401` / `403` | no valid token / token not allowed for that worker, a read-only token on a state-changing call, or a raw command in `workers` mode |
 | `404` | unknown worker or execution |
-| `409` | lock held with `lock_conflict: reject`, signal on a non-running execution, idempotency key reused with a different body |
+| `409` | lock held with `lock_conflict: reject`, signal on a non-running execution, idempotency key reused with a different body (`idempotency_reuse`), or the same key still being submitted by another request (`idempotency_in_flight` — repeat it) |
 | `422` | worker disabled |
 | `429` | queue full (`queue.max_depth`) |
 | `503` | daemon shutting down, or a service with no free slot (`no_capacity`) |
@@ -65,7 +65,17 @@ Errors always look the same:
 
 `Idempotency-Key` on `POST /v1/processes` replays the original response — with
 `Idempotent-Replay: true` — for as long as that execution is retained (`history.retention`,
-`history.max_rows`). The same key with a different body is a `409`.
+`history.max_rows`). The same key with a different body is a `409 idempotency_reuse`.
+
+The key is **claimed before the work starts**, not recorded after it: the case it exists for is a
+client that timed out and retried, and the first request is often still in flight when the second
+arrives. Whichever request claims the key runs the work; the others replay it, or get `409
+idempotency_in_flight` when the winner has not recorded its execution yet — repeat the request with
+the same key. A submission refused before anything ran (`429`, `503`) releases its claim, so the
+same key can be used again.
+
+Once the execution is purged the key goes with it, and the same key starts new work rather than
+answering `404`.
 
 It is the client's key, and on a hub it is forwarded as sent rather than invented: a `504
 dispatch_unknown` means the hub stopped and the client is the one that retries, so the key has to be

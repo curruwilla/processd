@@ -18,6 +18,14 @@ var (
 	ErrRawCommandDenied = errors.New("raw command execution is disabled")
 	ErrNotRunning       = errors.New("execution is not running")
 	ErrIdempotencyReuse = errors.New("idempotency key reused with a different request")
+	// ErrIdempotencyClaimed reports a key another request took first. It never
+	// reaches a client: the request that lost the race replays what the winner
+	// produced, which is what the key was for.
+	ErrIdempotencyClaimed = errors.New("idempotency key is already claimed")
+	// ErrIdempotencyInFlight reports a key whose execution is being submitted
+	// right now, so there is nothing to replay yet. It is deliberately not a
+	// failure: repeating the request with the same key is the way out.
+	ErrIdempotencyInFlight = errors.New("idempotency key is in flight")
 )
 
 // TransitionError reports an attempt to move an execution along an edge the

@@ -48,6 +48,7 @@ var sentinelStatus = []struct {
 	{core.ErrWorkerDisabled, http.StatusUnprocessableEntity, "worker_disabled"},
 	{core.ErrLockHeld, http.StatusConflict, "lock_held"},
 	{core.ErrIdempotencyReuse, http.StatusConflict, "idempotency_reuse"},
+	{core.ErrIdempotencyInFlight, http.StatusConflict, "idempotency_in_flight"},
 	{core.ErrNotRunning, http.StatusConflict, "not_running"},
 	{core.ErrQueueFull, http.StatusTooManyRequests, "queue_full"},
 	{core.ErrShuttingDown, http.StatusServiceUnavailable, "shutting_down"},

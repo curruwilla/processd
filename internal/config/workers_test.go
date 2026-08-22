@@ -86,6 +86,32 @@ func TestWorker_Validate(t *testing.T) {
 			mutate:  func(w *Worker) { w.Logs.Rotate.MaxFiles = -1 },
 			wantErr: "must not be negative",
 		},
+		{
+			name:    "a multiplier may not shrink the curve",
+			mutate:  func(w *Worker) { w.Retry.Enabled = Bool(true); w.Retry.Backoff.Multiplier = -2 },
+			wantErr: "multiplier must be greater than zero",
+		},
+		{
+			// Fail closed: a policy next to a switch that is off never runs, and a
+			// file promising five attempts on a worker that makes one is worse
+			// than a reload that does not apply.
+			name:    "a policy without the switch is refused",
+			mutate:  func(w *Worker) { w.Retry.MaxAttempts = 5 },
+			wantErr: "retry.enabled is not true",
+		},
+		{
+			name: "a backoff without the switch is refused",
+			mutate: func(w *Worker) {
+				w.Retry.Backoff = Backoff{Type: BackoffFixed, Initial: Duration(time.Second)}
+			},
+			wantErr: "retry.enabled is not true",
+		},
+		{
+			// success_exit_codes decides what an exit means, which a task answers
+			// whether or not it ever tries again.
+			name:   "exit-code meaning stands on its own",
+			mutate: func(w *Worker) { w.Retry.SuccessExitCodes = []int{0, 2} },
+		},
 	}
 
 	for _, tt := range tests {

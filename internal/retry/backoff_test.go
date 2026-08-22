@@ -45,6 +45,75 @@ func TestDelay(t *testing.T) {
 	}
 }
 
+// TestDelay_staysPositiveAtHighAttempts pins the curve past the point where it
+// leaves the int64 range. A negative delay would put retry_at in the past, and
+// a crash-looping service would then restart as fast as the node can fork it.
+func TestDelay_staysPositiveAtHighAttempts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		backoff config.Backoff
+	}{
+		{
+			name: "exponential with the service defaults",
+			backoff: config.Backoff{
+				Type:       config.BackoffExponential,
+				Initial:    config.Duration(5 * time.Second),
+				Max:        config.Duration(5 * time.Minute),
+				Multiplier: 2,
+			},
+		},
+		{
+			name: "exponential with jitter at the ceiling",
+			backoff: config.Backoff{
+				Type:       config.BackoffExponential,
+				Initial:    config.Duration(5 * time.Second),
+				Max:        config.Duration(5 * time.Minute),
+				Multiplier: 2,
+				Jitter:     1,
+			},
+		},
+		{
+			name: "linear",
+			backoff: config.Backoff{
+				Type:    config.BackoffLinear,
+				Initial: config.Duration(5 * time.Second),
+				Max:     config.Duration(5 * time.Minute),
+			},
+		},
+		{
+			name: "exponential with no ceiling at all",
+			backoff: config.Backoff{
+				Type:       config.BackoffExponential,
+				Initial:    config.Duration(5 * time.Second),
+				Multiplier: 2,
+			},
+		},
+	}
+
+	// 31 and 32 bracket the point where five seconds doubling leaves the range.
+	attempts := []int{31, 32, 33, 64, 1030, 1 << 30}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, attempt := range attempts {
+				got := Delay(tt.backoff, attempt)
+
+				if got <= 0 {
+					t.Errorf("Delay(attempt %d) = %s, want a positive delay", attempt, got)
+				}
+
+				if ceiling := tt.backoff.Max.Duration(); ceiling > 0 && tt.backoff.Jitter == 0 && got > ceiling {
+					t.Errorf("Delay(attempt %d) = %s, want at most the ceiling %s", attempt, got, ceiling)
+				}
+			}
+		})
+	}
+}
+
 func TestDelay_jitterStaysWithinBounds(t *testing.T) {
 	t.Parallel()
 

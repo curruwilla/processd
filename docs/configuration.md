@@ -39,11 +39,11 @@ Every key is optional; the defaults below are what a missing file gives you.
 | `allowed_commands` | list of paths | `[]` | absolute paths, used only in `raw` mode |
 | `allow_root_processes` | bool | `false` | allows running without `user` when the daemon is root |
 | `queue.max_depth` | int > 0 | `1000` | a full queue answers `429` |
-| `queue.item_ttl` | duration | `1h` | an item that waited longer fails with `queue_timeout`. A service never expires this way |
+| `queue.item_ttl` | duration | `1h` | an item that waited longer fails with `queue_timeout`. The wait is counted from the moment it entered the queue, including an execution put back there by `retry.on_shutdown`. A service never expires this way |
 | `history.retention` | duration | `30d` | GC of finished executions |
 | `history.max_rows` | int | `500000` | ceiling of retained rows |
 | `logs.max_bytes_per_stream` | byte size > 0 | `32MiB` | cap per stream per attempt; reaching it marks `log_truncated` |
-| `logs.retention` | duration | `14d` | GC of log files |
+| `logs.retention` | duration | `14d` | GC of log files. An attempt that is still writing keeps its files however old they look, so a quiet long-lived service does not lose the log it is holding open |
 | `notify` | object | none | the fallback notification policy, in the same shape a worker uses. A worker that declares its own replaces it — see [Notifications](notifications.md) |
 | `fleet.nodes[].name` | string | — required | unique; how the node is named in every fleet answer |
 | `fleet.nodes[].url` | URL | — required | `http` or `https`, with a host |

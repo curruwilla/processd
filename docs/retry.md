@@ -6,6 +6,12 @@ first, and when it gives up.
 `enabled` is tri-state: absent is not the same as `false`. A `task` without the key does not retry; a
 `service` without it restarts, and an explicit `enabled: false` on a service is refused at load.
 
+Writing the rest of the policy without turning it on is refused too: a `retry` block that sets
+`max_attempts`, `retry_on`, `reset_after`, `on_shutdown` or `backoff` while `enabled` is not `true`
+fails the load rather than being ignored. `success_exit_codes` and `no_retry_exit_codes` are the
+exception — they decide what an exit *means*, which a task answers whether or not it ever tries
+again.
+
 ```yaml
 retry:
   enabled: true
@@ -58,7 +64,8 @@ The `max` ceiling is applied before the jitter.
   `CANCELED` with `reason: user_request` and no attempt follows.
 * **`on_shutdown: true` survives a daemon restart.** The execution is returned to the queue and comes
   back by itself on the next start, keeping its id. Without it, it ends as `CANCELED` and needs a new
-  `processd run`. See [Updating](updating.md).
+  `processd run`. See [Updating](updating.md). The wait starts when it goes back in line, so
+  `queue.item_ttl` measures the queue and not how long the execution had already been running.
 
 Every state a retry passes through — `CRASHED → RETRYING → STARTING` — is in
 [Lifecycle](lifecycle.md), and a retry that spends its budget is what fires the

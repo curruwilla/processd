@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/curruwilla/processd/internal/metrics"
 	"github.com/curruwilla/processd/internal/queue"
 	"github.com/curruwilla/processd/internal/runner"
+	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/store/sqlite"
 	"github.com/curruwilla/processd/internal/supervisor"
 )
@@ -80,6 +83,18 @@ func newLiveServer(t *testing.T) http.Handler {
 func newLiveServerWith(t *testing.T, tune func(*Options)) http.Handler {
 	t.Helper()
 
+	handler, _ := newLiveNode(t, nil, tune)
+
+	return handler
+}
+
+// newLiveNode builds the same graph and hands back the store with it, for the
+// tests that check what the handlers wrote rather than what they answered. The
+// configuration hook runs before the graph is built, since the components read
+// it once and keep their own copy.
+func newLiveNode(t *testing.T, tuneConfig func(*config.Config), tune func(*Options)) (http.Handler, store.Store) {
+	t.Helper()
+
 	workersDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workersDir, "w.yaml"), []byte(liveWorkers), 0o600); err != nil {
 		t.Fatalf("writing workers: %v", err)
@@ -103,6 +118,10 @@ func newLiveServerWith(t *testing.T, tune func(*Options)) http.Handler {
 	cfg.MaxProcesses = 2
 	cfg.AllowRootProcesses = true
 	cfg.Auth.Tokens = []config.Token{{Name: "test", Hash: HashToken(testToken)}}
+
+	if tuneConfig != nil {
+		tuneConfig(&cfg)
+	}
 
 	log := slog.New(slog.DiscardHandler)
 	logs := logstore.New(t.TempDir(), 1<<20)
@@ -133,7 +152,7 @@ func newLiveServerWith(t *testing.T, tune func(*Options)) http.Handler {
 		tune(&opts)
 	}
 
-	return New(opts).Handler()
+	return New(opts).Handler(), db
 }
 
 func do(t *testing.T, handler http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -257,6 +276,126 @@ func TestServer_createProcess_idempotency(t *testing.T) {
 	reuse := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"8"}}`, headers)
 	if reuse.Code != http.StatusConflict {
 		t.Errorf("reusing the key with another payload returned %d, want 409", reuse.Code)
+	}
+}
+
+// A client that timed out and retried is what the key exists for, and its first
+// request is often still in flight when the second one arrives. Both find no
+// record, so the key has to be a claim taken before the work rather than a note
+// written after it.
+func TestServer_createProcess_idempotencyUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServer(t)
+	body := `{"worker":"hello","params":{"id":"7"}}`
+	headers := map[string]string{idempotencyHeader: "key-racing"}
+
+	const copies = 8
+
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		ids       = map[string]bool{}
+		conflicts int
+	)
+
+	for range copies {
+		wg.Go(func() {
+			response := do(t, handler, http.MethodPost, "/v1/processes", body, headers)
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			switch response.Code {
+			case http.StatusCreated, http.StatusAccepted, http.StatusOK:
+				ids[decode[createProcessResponse](t, response).ID] = true
+			case http.StatusConflict:
+				// The winner had the key but had not recorded its execution yet.
+				conflicts++
+			default:
+				t.Errorf("POST returned %d (%s)", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if len(ids) != 1 {
+		t.Errorf("the same key produced %d executions, want 1: %v", len(ids), ids)
+	}
+
+	listed := decode[listResponse](t, do(t, handler, http.MethodGet, "/v1/processes", "", nil))
+	if len(listed.Items) != 1 {
+		t.Errorf("the node holds %d executions, want 1", len(listed.Items))
+	}
+}
+
+// A request refused before it ran must leave its key free: a queue that was
+// full a moment ago is a reason to repeat the request, not to refuse it for as
+// long as the history is kept.
+func TestServer_createProcess_idempotencyReleasedWhenNothingRan(t *testing.T) {
+	t.Parallel()
+
+	handler, db := newLiveNode(t, func(cfg *config.Config) {
+		cfg.MaxProcesses = 1
+		cfg.Queue.MaxDepth = 1
+	}, nil)
+
+	// One execution takes the only slot, a second fills the only queue place.
+	for _, id := range []string{"1", "2"} {
+		seeded := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"sleeper"}`, nil)
+		if seeded.Code != http.StatusCreated && seeded.Code != http.StatusAccepted {
+			t.Fatalf("seeding %s returned %d (%s)", id, seeded.Code, seeded.Body.String())
+		}
+	}
+
+	headers := map[string]string{idempotencyHeader: "key-refused"}
+
+	refused := do(t, handler, http.MethodPost, "/v1/processes", `{"worker":"hello","params":{"id":"7"}}`, headers)
+	if refused.Code != http.StatusTooManyRequests {
+		t.Fatalf("POST into a full queue returned %d (%s), want 429", refused.Code, refused.Body.String())
+	}
+
+	if _, err := db.FindIdempotency(t.Context(), "key-refused"); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("FindIdempotency() returned %v, want the claim released with core.ErrNotFound", err)
+	}
+}
+
+// A key outlives nothing: once the execution it replays has been purged, the
+// request is new again. Answering "your own key is unknown" would refuse a
+// request the client is entitled to repeat.
+func TestServer_createProcess_idempotencyAfterThePurge(t *testing.T) {
+	t.Parallel()
+
+	handler, db := newLiveNode(t, nil, nil)
+
+	body := `{"worker":"hello","params":{"id":"7"}}`
+	headers := map[string]string{idempotencyHeader: "key-purged"}
+
+	first := do(t, handler, http.MethodPost, "/v1/processes", body, headers)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first POST returned %d (%s), want 201", first.Code, first.Body.String())
+	}
+
+	created := decode[createProcessResponse](t, first)
+	awaitState(t, handler, created.ID)
+
+	if _, err := db.PurgeHistory(t.Context(), time.Now().UTC().Add(time.Hour), 0); err != nil {
+		t.Fatalf("PurgeHistory() returned %v, want nil", err)
+	}
+
+	// The key went with the execution it pointed at.
+	if _, err := db.FindIdempotency(t.Context(), "key-purged"); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("FindIdempotency() returned %v, want the key purged with its execution", err)
+	}
+
+	again := do(t, handler, http.MethodPost, "/v1/processes", body, headers)
+	if again.Code != http.StatusCreated {
+		t.Fatalf("repeating the request returned %d (%s), want 201", again.Code, again.Body.String())
+	}
+
+	if decode[createProcessResponse](t, again).ID == created.ID {
+		t.Error("the repeat replayed a purged execution, want a new one")
 	}
 }
 
@@ -481,6 +620,55 @@ func TestServer_createProcess_rawServiceDenied(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("POST returned %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+}
+
+// Fail closed: a raw command has no worker, so the fields only a worker can
+// answer for are refused rather than accepted and dropped. Ignoring them
+// silently would run something other than what was asked for.
+func TestServer_createProcess_rawRefusesWorkerFields(t *testing.T) {
+	t.Parallel()
+
+	handler := newLiveServerWith(t, func(opts *Options) {
+		opts.Config.ExecutionMode = config.ExecutionModeRaw
+		opts.Config.AllowedCommands = []string{"/bin/echo"}
+	})
+
+	tests := []struct {
+		name string
+		body string
+		code string
+	}{
+		{
+			name: "a worker as well as a command",
+			body: `{"command":"/bin/echo","worker":"hello"}`,
+			code: "command_and_worker",
+		},
+		{
+			name: "params nothing declared",
+			body: `{"command":"/bin/echo","params":{"id":"7"}}`,
+			code: "params_denied",
+		},
+		{
+			name: "a timeout no worker allowed",
+			body: `{"command":"/bin/echo","timeout":"5s"}`,
+			code: "timeout_denied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := do(t, handler, http.MethodPost, "/v1/processes", tt.body, nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST returned %d (%s), want 400", rec.Code, rec.Body.String())
+			}
+
+			if got := decode[errorBody](t, rec).Error.Code; got != tt.code {
+				t.Errorf("error code = %q, want %q", got, tt.code)
+			}
+		})
 	}
 }
 

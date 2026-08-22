@@ -271,7 +271,7 @@ func (r *Runner) accountForDowntime(
 		return
 	}
 
-	missed := planned.schedule.Between(*state.LastFiredAt, now, maxMissed)
+	missed := planned.schedule.Between(accountedThrough(*state), now, maxMissed)
 	if len(missed) == 0 {
 		r.plan(planned, now)
 		return
@@ -282,9 +282,7 @@ func (r *Runner) accountForDowntime(
 	if catchUp {
 		// One firing, not one per missed occurrence: catching up an entire
 		// weekend of a minutely schedule is an incident, not a recovery.
-		planned.occurrence = last
-		planned.fireAt = now
-		planned.planned = true
+		r.setPlan(planned, last, now)
 
 		r.log.Warn("catching up a missed schedule",
 			slog.String("worker", planned.worker),
@@ -313,11 +311,31 @@ func (r *Runner) accountForDowntime(
 	r.plan(planned, now)
 }
 
+// accountedThrough is the last occurrence a schedule has already answered for,
+// by running it or by recording that it did not.
+//
+// Counting downtime from the last firing alone would report the same window
+// again on every restart that happens before the schedule next fires: three
+// restarts after an hour of a minutely schedule being down would report three
+// hundred and eighty missed runs instead of sixty.
+func accountedThrough(state store.ScheduleState) time.Time {
+	through := time.Time{}
+	if state.LastFiredAt != nil {
+		through = *state.LastFiredAt
+	}
+
+	if state.LastMissedAt != nil && state.LastMissedAt.After(through) {
+		through = *state.LastMissedAt
+	}
+
+	return through
+}
+
 // plan points an entry at the first occurrence after from.
 func (r *Runner) plan(planned *entry, from time.Time) {
 	occurrence, ok := planned.schedule.Next(from)
 	if !ok {
-		planned.planned = false
+		r.unplan(planned)
 
 		r.log.Warn("schedule has no reachable occurrence",
 			slog.String("worker", planned.worker),
@@ -327,9 +345,30 @@ func (r *Runner) plan(planned *entry, from time.Time) {
 		return
 	}
 
+	r.setPlan(planned, occurrence, occurrence.Add(jitterOf(planned.jitter)))
+}
+
+// setPlan points an entry at an occurrence and at the moment it will be
+// submitted.
+//
+// The entries are read by Status, which the API calls from its own goroutines,
+// so they are written under the lock that guards the map holding them: mu owns
+// the plan, not just the map it lives in.
+func (r *Runner) setPlan(planned *entry, occurrence, fireAt time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	planned.occurrence = occurrence
-	planned.fireAt = occurrence.Add(jitterOf(planned.jitter))
+	planned.fireAt = fireAt
 	planned.planned = true
+}
+
+// unplan marks an entry as having nothing to fire.
+func (r *Runner) unplan(planned *entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	planned.planned = false
 }
 
 // jitterOf spreads a firing across the configured window.
@@ -477,15 +516,12 @@ func (r *Runner) recordFiring(ctx context.Context, planned *entry) {
 func (r *Runner) advance(ctx context.Context, planned *entry, now time.Time) {
 	next, ok := planned.schedule.Next(planned.occurrence)
 	if !ok {
-		planned.planned = false
+		r.unplan(planned)
 		return
 	}
 
 	if next.After(now) {
-		planned.occurrence = next
-		planned.fireAt = next.Add(jitterOf(planned.jitter))
-		planned.planned = true
-
+		r.setPlan(planned, next, next.Add(jitterOf(planned.jitter)))
 		return
 	}
 

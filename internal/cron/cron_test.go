@@ -253,6 +253,46 @@ func TestSchedule_Next_FallBack(t *testing.T) {
 	}
 }
 
+// TestSchedule_Next_FractionalOffsetZone pins the zones whose offset is not a
+// whole number of hours. Advancing the hour on the absolute clock lands
+// mid-hour there, and every hour-restricted expression then skips the first
+// half of the hour it is looking for.
+func TestSchedule_Next_FractionalOffsetZone(t *testing.T) {
+	t.Parallel()
+
+	zones := []struct {
+		name string
+		zone string
+	}{
+		{"half hour ahead", "Asia/Kolkata"},
+		{"three quarters of an hour ahead", "Asia/Kathmandu"},
+		{"half hour behind", "America/St_Johns"},
+	}
+
+	for _, tt := range zones {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			loc, err := time.LoadLocation(tt.zone)
+			if err != nil {
+				t.Skipf("zone database unavailable: %v", err)
+			}
+
+			schedule := mustParse(t, "0 11 * * *", loc)
+
+			got, ok := schedule.Next(time.Date(2026, 8, 22, 9, 0, 0, 0, loc))
+			if !ok {
+				t.Fatalf("Next found no occurrence of %q in %s", schedule.Spec(), tt.zone)
+			}
+
+			want := time.Date(2026, 8, 22, 11, 0, 0, 0, loc)
+			if !got.Equal(want) {
+				t.Fatalf("Next = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestSchedule_Between(t *testing.T) {
 	t.Parallel()
 

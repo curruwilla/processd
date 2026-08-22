@@ -89,7 +89,9 @@ Changing `processd.yaml` itself is different: it is read at startup only, so it 
 
 Back the state up with the daemon stopped, so the database file is consistent — and always before an
 upgrade. Retention is enforced by the daemon itself: `history.retention` and `history.max_rows` for
-executions, `logs.retention` for output files.
+executions, `logs.retention` for output files. Purging an execution takes its `Idempotency-Key` with
+it, and an attempt still writing keeps its log files however old they look — a service that logged at
+start-up and has been quiet since is older than the window and still running.
 
 ## Runbook
 

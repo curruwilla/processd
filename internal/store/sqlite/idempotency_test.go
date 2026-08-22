@@ -40,6 +40,49 @@ func TestStore_Idempotency(t *testing.T) {
 	}
 }
 
+// The claim is what makes the key useful: two copies of the same request
+// cannot both take it, so they cannot both start the work.
+func TestStore_Idempotency_claim(t *testing.T) {
+	t.Parallel()
+
+	db := newTestStore(t)
+	ctx := t.Context()
+
+	first := store.Idempotency{Key: "key-1", RequestHash: "hash-1", ProcessID: "proc_1", CreatedAt: time.Now().UTC()}
+
+	if err := db.SaveIdempotency(ctx, first); err != nil {
+		t.Fatalf("SaveIdempotency() returned %v, want nil", err)
+	}
+
+	// The same execution re-claiming its own key succeeds.
+	if err := db.SaveIdempotency(ctx, first); err != nil {
+		t.Errorf("re-claiming the same key returned %v, want nil", err)
+	}
+
+	second := store.Idempotency{Key: "key-1", RequestHash: "hash-1", ProcessID: "proc_2", CreatedAt: time.Now().UTC()}
+
+	if err := db.SaveIdempotency(ctx, second); !errors.Is(err, core.ErrIdempotencyClaimed) {
+		t.Errorf("SaveIdempotency() returned %v, want core.ErrIdempotencyClaimed", err)
+	}
+
+	// Releasing is scoped to the holder: a loser cannot free the winner's claim.
+	if err := db.DeleteIdempotency(ctx, "key-1", "proc_2"); err != nil {
+		t.Fatalf("DeleteIdempotency() returned %v, want nil", err)
+	}
+
+	if _, err := db.FindIdempotency(ctx, "key-1"); err != nil {
+		t.Errorf("FindIdempotency() returned %v, want the winner's claim intact", err)
+	}
+
+	if err := db.DeleteIdempotency(ctx, "key-1", "proc_1"); err != nil {
+		t.Fatalf("DeleteIdempotency() returned %v, want nil", err)
+	}
+
+	if _, err := db.FindIdempotency(ctx, "key-1"); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("FindIdempotency() returned %v, want core.ErrNotFound", err)
+	}
+}
+
 func TestStore_AppendAudit(t *testing.T) {
 	t.Parallel()
 

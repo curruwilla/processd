@@ -1,6 +1,8 @@
 package supervisor
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -77,6 +79,20 @@ workers:
     logs:
       rotate:
         max_files: 2
+  - name: stubborn
+    command: /bin/sh
+    args: ["-c", "trap '' TERM; sleep 30"]
+    cwd: /tmp
+    kill_grace: 1s
+  - name: surviving-batch
+    command: /bin/sleep
+    args: ["30"]
+    cwd: /tmp
+    kill_grace: 1s
+    retry:
+      enabled: true
+      on_shutdown: true
+      backoff: {type: fixed, initial: 10ms, max: 10ms, jitter: 0}
   - name: fatal-api
     type: service
     command: /bin/false
@@ -96,6 +112,19 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, tune func(*config.Config)) *harness {
+	t.Helper()
+
+	return newHarnessWith(t, tune, nil, nil)
+}
+
+// newHarnessWith builds the same harness with the store and the runner wrapped,
+// so a test can make one of them misbehave at a chosen moment.
+func newHarnessWith(
+	t *testing.T,
+	tune func(*config.Config),
+	wrapStore func(store.Store) store.Store,
+	wrapRunner func(runner.Runner) runner.Runner,
+) *harness {
 	t.Helper()
 
 	workersDir := t.TempDir()
@@ -124,10 +153,20 @@ func newHarness(t *testing.T, tune func(*config.Config)) *harness {
 		tune(&cfg)
 	}
 
-	logs := logstore.New(t.TempDir(), 1<<20)
-	sup := New(cfg, db, runner.NewExecRunner(), logs, slog.New(slog.DiscardHandler))
+	var backing store.Store = db
+	if wrapStore != nil {
+		backing = wrapStore(backing)
+	}
 
-	h := &harness{supervisor: sup, store: db, finished: make(chan *core.Process, 8)}
+	var run runner.Runner = runner.NewExecRunner()
+	if wrapRunner != nil {
+		run = wrapRunner(run)
+	}
+
+	logs := logstore.New(t.TempDir(), 1<<20)
+	sup := New(cfg, backing, run, logs, slog.New(slog.DiscardHandler))
+
+	h := &harness{supervisor: sup, store: backing, finished: make(chan *core.Process, 8)}
 
 	sup.SetWorkers(func() *config.Registry { return registry })
 	sup.SetOnSettle(func(p *core.Process) { h.finished <- p })
@@ -271,6 +310,98 @@ func TestSupervisor_Start_reportsStartFailure(t *testing.T) {
 	}
 }
 
+// unavailableStore fails one chosen UpdateProcess, which is what a store
+// refusing a write in the middle of a start looks like: a cancelled request, a
+// busy database, a disk with nothing left on it.
+type unavailableStore struct {
+	store.Store
+
+	mu     sync.Mutex
+	failAt int
+	calls  int
+}
+
+func (u *unavailableStore) UpdateProcess(ctx context.Context, p *core.Process) error {
+	u.mu.Lock()
+	u.calls++
+	failing := u.calls == u.failAt
+	u.mu.Unlock()
+
+	if failing {
+		return errors.New("store is unavailable")
+	}
+
+	return u.Store.UpdateProcess(ctx, p)
+}
+
+// recordingRunner keeps the handle of the last process it started, so a test
+// can ask the kernel whether that process is still there.
+type recordingRunner struct {
+	runner.Runner
+
+	mu      sync.Mutex
+	started *runner.Handle
+}
+
+func (r *recordingRunner) Start(ctx context.Context, spec runner.Spec) (*runner.Handle, error) {
+	handle, err := r.Runner.Start(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	r.started = handle
+	r.mu.Unlock()
+
+	return handle, nil
+}
+
+func (r *recordingRunner) handle() *runner.Handle {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.started
+}
+
+// TestSupervisor_Start_abandonsAnUnsupervisableAttempt pins the window between
+// the fork and the bookkeeping that makes the process reachable. If the write
+// that records it fails, nothing is waiting on the process, no id maps to it,
+// and the scheduler is about to give its slot away — so it has to be stopped
+// here rather than left running past max_processes with no way to see it.
+func TestSupervisor_Start_abandonsAnUnsupervisableAttempt(t *testing.T) {
+	t.Parallel()
+
+	var recorder *recordingRunner
+
+	h := newHarnessWith(t, nil,
+		func(backing store.Store) store.Store {
+			// The first update is the one that takes the attempt under supervision.
+			return &unavailableStore{Store: backing, failAt: 1}
+		},
+		func(base runner.Runner) runner.Runner {
+			recorder = &recordingRunner{Runner: base}
+			return recorder
+		},
+	)
+
+	h.start(t, "proc_unsupervisable", "sleeper", "/bin/sleep", []string{"30"})
+
+	finished := h.awaitFinish(t)
+
+	if finished.State != core.StateFailed || finished.Reason != core.ReasonStartError {
+		t.Errorf("execution is %s/%s, want FAILED/start_error", finished.State, finished.Reason)
+	}
+
+	handle := recorder.handle()
+	if handle == nil {
+		t.Fatal("the runner never started a process")
+	}
+
+	if runner.SameProcess(handle.PID, handle.PIDStartTime) {
+		t.Errorf("pid %d is still running, want the abandoned attempt stopped and reaped", handle.PID)
+	}
+}
+
 func TestSupervisor_Stop(t *testing.T) {
 	t.Parallel()
 
@@ -289,6 +420,45 @@ func TestSupervisor_Stop(t *testing.T) {
 
 	if finished.Signal != "SIGTERM" {
 		t.Errorf("signal = %q, want SIGTERM", finished.Signal)
+	}
+}
+
+// TestSupervisor_Stop_survivesTheCaller pins that the grace period belongs to
+// the process. A cancelled context tells the runner to give up waiting and
+// escalate, so a client hanging up mid-stop must not reach it: the process that
+// ignores SIGTERM has to keep its full grace, and the answer must not wait for
+// it either.
+func TestSupervisor_Stop_survivesTheCaller(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, nil)
+	h.start(t, "proc_stubborn", "stubborn", "/bin/sh", []string{"-c", "trap '' TERM; sleep 30"})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // the client hung up before the grace period elapsed
+
+	asked := time.Now()
+
+	if err := h.supervisor.Stop(ctx, "proc_stubborn", 750*time.Millisecond); err != nil {
+		t.Fatalf("Stop() returned %v, want nil", err)
+	}
+
+	if answered := time.Since(asked); answered > 250*time.Millisecond {
+		t.Errorf("Stop() took %s to answer, want it to return without waiting out the grace", answered)
+	}
+
+	finished := h.awaitFinish(t)
+
+	if elapsed := time.Since(asked); elapsed < 750*time.Millisecond {
+		t.Errorf("the process died after %s, want it to keep its full 750ms grace", elapsed)
+	}
+
+	if finished.State != core.StateCanceled || finished.Reason != core.ReasonUserRequest {
+		t.Errorf("execution is %s/%s, want CANCELED/user_request", finished.State, finished.Reason)
+	}
+
+	if finished.Signal != "SIGKILL" {
+		t.Errorf("signal = %q, want SIGKILL after the grace elapsed", finished.Signal)
 	}
 }
 
@@ -635,6 +805,40 @@ func TestSupervisor_Shutdown_service(t *testing.T) {
 
 	if finished.State != core.StateQueued || finished.Reason != core.ReasonShutdown {
 		t.Errorf("state = %s/%s, want QUEUED/shutdown", finished.State, finished.Reason)
+	}
+}
+
+// An execution put back in the queue starts waiting now, not when it was
+// submitted. queue.item_ttl measures the wait, so a task that ran for longer
+// than the TTL would otherwise be expired by the very daemon start that was
+// supposed to resume it.
+func TestSupervisor_Shutdown_requeueRestartsTheQueueClock(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, nil)
+
+	p := h.build("proc_batch", "surviving-batch", "/bin/sleep", []string{"30"})
+	p.CreatedAt = time.Now().UTC().Add(-2 * time.Hour)
+	h.launch(t, p)
+
+	before := time.Now().UTC()
+
+	if err := h.supervisor.Shutdown(t.Context(), 500*time.Millisecond); err != nil {
+		t.Fatalf("Shutdown() returned %v, want nil", err)
+	}
+
+	finished := h.awaitFinish(t)
+
+	if finished.State != core.StateQueued || finished.Reason != core.ReasonShutdown {
+		t.Fatalf("state = %s/%s, want QUEUED/shutdown", finished.State, finished.Reason)
+	}
+
+	if finished.QueuedAt == nil {
+		t.Fatal("QueuedAt is nil, want the instant the execution went back in line")
+	}
+
+	if finished.QueuedAt.Before(before) {
+		t.Errorf("QueuedAt = %s, want it at or after the shutdown at %s", finished.QueuedAt, before)
 	}
 }
 

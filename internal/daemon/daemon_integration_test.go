@@ -49,6 +49,15 @@ workers:
     args: ["30"]
     cwd: /tmp
     kill_grace: 1s
+  - name: surviving-batch
+    command: /bin/sleep
+    args: ["30"]
+    cwd: /tmp
+    kill_grace: 1s
+    retry:
+      enabled: true
+      on_shutdown: true
+      backoff: {type: fixed, initial: 50ms, max: 50ms, jitter: 0}
 `
 
 type testDaemon struct {
@@ -233,6 +242,7 @@ type processView struct {
 	PID      *int       `json:"pid"`
 	Attempt  int        `json:"attempt"`
 	ExitCode *int       `json:"exit_code"`
+	QueuedAt *time.Time `json:"queued_at"`
 }
 
 func (d *testDaemon) submit(body string) processView {
@@ -413,6 +423,63 @@ func TestDaemon_recoversAfterRestart(t *testing.T) {
 	if _, err := os.Stat(fmt.Sprintf("/proc/%d", *running.PID)); err == nil {
 		t.Errorf("pid %d is still alive after shutdown", *running.PID)
 	}
+}
+
+// retry.on_shutdown returns the execution to the queue instead of cancelling
+// it, and the next daemon start has to actually run it. The wait it is judged
+// against by queue.item_ttl starts when it goes back in line, not when it was
+// submitted — otherwise a batch job that ran for longer than the TTL would be
+// expired by the very start that was supposed to resume it.
+func TestDaemon_resumesAnExecutionItPutBackInTheQueue(t *testing.T) {
+	t.Parallel()
+
+	cfg := newConfig(t)
+	daemon := start(t, cfg)
+
+	submittedAt := time.Now().UTC()
+	created := daemon.submit(`{"worker":"surviving-batch"}`)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && daemon.get(created.ID).PID == nil {
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if daemon.get(created.ID).PID == nil {
+		t.Fatal("execution never reported a pid")
+	}
+
+	daemon.shutdown()
+
+	restarted := start(t, cfg)
+	defer restarted.shutdown()
+
+	deadline = time.Now().Add(5 * time.Second)
+
+	for time.Now().Before(deadline) {
+		resumed := restarted.get(created.ID)
+
+		if resumed.QueuedAt == nil {
+			t.Fatal("QueuedAt is nil, want the instant the execution went back in line")
+		}
+
+		if resumed.QueuedAt.Before(submittedAt) {
+			t.Fatalf("QueuedAt = %s, want it dated from the shutdown rather than the submission",
+				resumed.QueuedAt)
+		}
+
+		if resumed.PID != nil {
+			return
+		}
+
+		if resumed.Status.IsTerminal() {
+			t.Fatalf("execution is %s/%s after the restart, want it running again",
+				resumed.Status, resumed.Reason)
+		}
+
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	t.Fatal("execution never came back after the restart")
 }
 
 func TestDaemon_streamsAttemptLogs(t *testing.T) {

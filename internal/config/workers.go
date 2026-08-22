@@ -312,6 +312,20 @@ func (r Retry) EffectiveAttempts() int {
 	return max(r.MaxAttempts.Int(), 1)
 }
 
+// declaresPolicy reports whether the file set a retry key that means nothing
+// unless retries are on.
+//
+// success_exit_codes and no_retry_exit_codes are deliberately not on the list:
+// they decide what an exit means, which is a question a task answers whether or
+// not it ever tries again.
+func (r Retry) declaresPolicy() bool {
+	return r.MaxAttempts != 0 ||
+		len(r.RetryOn) > 0 ||
+		r.ResetAfter != 0 ||
+		r.OnShutdown ||
+		r.Backoff != (Backoff{})
+}
+
 // RetriesOn reports whether the trigger is in the worker's retry policy.
 func (w *Worker) RetriesOn(trigger RetryTrigger) bool {
 	return w.Retry.IsEnabled() && slices.Contains(w.Retry.RetryOn, trigger)
@@ -663,6 +677,16 @@ func (w *Worker) validateParams() []error {
 
 func (w *Worker) validateRetry() []error {
 	if !w.Retry.IsEnabled() {
+		// Fail closed. A policy written next to a switch that is off never runs,
+		// and a file that reads "max_attempts: 5" on a worker that makes one
+		// attempt is a worse answer than a reload that does not apply.
+		if w.Retry.declaresPolicy() {
+			return []error{errors.New(
+				"retry declares a policy but retry.enabled is not true, so none of it would apply: " +
+					"set retry.enabled: true, or remove the policy",
+			)}
+		}
+
 		return nil
 	}
 
@@ -674,6 +698,21 @@ func (w *Worker) validateRetry() []error {
 
 	if w.Retry.Backoff.Jitter < 0 || w.Retry.Backoff.Jitter > 1 {
 		errs = append(errs, errors.New("retry.backoff.jitter must be between 0 and 1"))
+	}
+
+	// A multiplier of zero is the absent key, and applyRetryDefaults fills it in.
+	// Anything below that shrinks the curve towards zero, which is a backoff that
+	// does not back off.
+	if w.Retry.Backoff.Multiplier < 0 {
+		errs = append(errs, errors.New("retry.backoff.multiplier must be greater than zero"))
+	}
+
+	if w.Retry.Backoff.Initial < 0 {
+		errs = append(errs, errors.New("retry.backoff.initial must not be negative"))
+	}
+
+	if w.Retry.Backoff.Max < 0 {
+		errs = append(errs, errors.New("retry.backoff.max must not be negative"))
 	}
 
 	switch w.Retry.Backoff.Type {

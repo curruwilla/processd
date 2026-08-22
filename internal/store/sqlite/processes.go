@@ -498,6 +498,10 @@ func (s *Store) PurgeHistory(ctx context.Context, before time.Time, maxRows int)
 		removed += int(affected)
 	}
 
+	if err := s.purgeIdempotency(ctx, before); err != nil {
+		return removed, err
+	}
+
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM audit_log WHERE at < ?`, formatTime(before)); err != nil {
 		return removed, fmt.Errorf("purging audit log: %w", err)
 	}

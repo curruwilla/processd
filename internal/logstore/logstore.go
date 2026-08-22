@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -67,21 +68,68 @@ type Policy struct {
 type Store struct {
 	root     string
 	maxBytes int64
+
+	// mu guards open, which names the files the attempts under supervision are
+	// writing to right now.
+	//
+	// Retention walks the directory by age, and an attempt is not necessarily
+	// younger than the window: a service that logs at start-up and then goes
+	// quiet outlives it. Unlinking the file underneath the writer costs every
+	// line it produces from then on — the descriptor stays valid, so the process
+	// notices nothing and the output lands in an inode nobody can open again.
+	mu   sync.Mutex
+	open map[string]int
 }
 
 // New returns a store rooted at dir, capping each stream at maxBytes.
 func New(dir string, maxBytes int64) *Store {
-	return &Store{root: dir, maxBytes: maxBytes}
+	return &Store{root: dir, maxBytes: maxBytes, open: map[string]int{}}
 }
 
 // Path returns the file backing one stream of one attempt. The live output of a
 // rotating stream always stays here: rotation moves the older content aside, so
 // a follower has one path to poll rather than a moving target.
 func (s *Store) Path(processID string, attempt int, stream Stream, at time.Time) string {
-	day := at.UTC()
-	name := fmt.Sprintf("%s.%d.%s.log", processID, attempt, stream)
+	return filepath.Join(s.root, filepath.FromSlash(relPath(processID, attempt, stream, at)))
+}
 
-	return filepath.Join(s.root, day.Format("2006"), day.Format("01"), name)
+// relPath is the same file, named as the retention walk sees it: relative to
+// the log root and slash-separated, which is what io/fs hands a WalkDir func
+// whatever the host separator is.
+func relPath(processID string, attempt int, stream Stream, at time.Time) string {
+	day := at.UTC()
+
+	return fmt.Sprintf("%s/%s/%s.%d.%s.log", day.Format("2006"), day.Format("01"), processID, attempt, stream)
+}
+
+// markOpen records that an attempt is writing to a file, so retention leaves it
+// alone until it is closed.
+func (s *Store) markOpen(rel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.open[rel]++
+}
+
+// markClosed releases the protection markOpen took.
+func (s *Store) markClosed(rel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.open[rel] <= 1 {
+		delete(s.open, rel)
+		return
+	}
+
+	s.open[rel]--
+}
+
+// isOpen reports whether an attempt is writing to the file right now.
+func (s *Store) isOpen(rel string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.open[rel] > 0
 }
 
 // RotatedPath returns the file holding the generation-th rotation of a stream.
@@ -98,6 +146,11 @@ func rotatedPath(path string, generation int) string {
 type Attempt struct {
 	Stdout *StreamWriter
 	Stderr *StreamWriter
+
+	// store and files are what Close needs to hand the attempt's files back to
+	// retention. An Attempt built without a store closes just the same.
+	store *Store
+	files []string
 }
 
 // Create opens the log files of an attempt. A MaxBytesPerStream of zero uses
@@ -115,10 +168,21 @@ func (s *Store) Create(processID string, attempt int, at time.Time, policy Polic
 	stderr, err := s.openStream(processID, attempt, StreamStderr, at, policy)
 	if err != nil {
 		_ = stdout.Close()
+
+		s.markClosed(relPath(processID, attempt, StreamStdout, at))
+
 		return nil, err
 	}
 
-	return &Attempt{Stdout: stdout, Stderr: stderr}, nil
+	return &Attempt{
+		Stdout: stdout,
+		Stderr: stderr,
+		store:  s,
+		files: []string{
+			relPath(processID, attempt, StreamStdout, at),
+			relPath(processID, attempt, StreamStderr, at),
+		},
+	}, nil
 }
 
 func (s *Store) openStream(
@@ -134,8 +198,13 @@ func (s *Store) openStream(
 		return nil, fmt.Errorf("creating log dir for %s: %w", processID, err)
 	}
 
+	// Claimed before the file exists, so a retention pass running in between
+	// cannot delete what is about to be written to.
+	s.markOpen(relPath(processID, attempt, stream, at))
+
 	file, err := createLogFile(path)
 	if err != nil {
+		s.markClosed(relPath(processID, attempt, stream, at))
 		return nil, err
 	}
 
@@ -165,8 +234,19 @@ func (a *Attempt) Truncated() bool {
 	return a.Stdout.Truncated() || a.Stderr.Truncated()
 }
 
-// Close flushes and closes the underlying files.
+// Close flushes and closes the underlying files, and hands them back to
+// retention.
 func (a *Attempt) Close() error {
+	if a.store != nil {
+		defer func() {
+			for _, file := range a.files {
+				a.store.markClosed(file)
+			}
+
+			a.files = nil
+		}()
+	}
+
 	err := a.Stdout.Close()
 
 	if stderrErr := a.Stderr.Close(); err == nil {
@@ -583,6 +663,13 @@ func (s *Store) Purge(before time.Time) (int, error) {
 		}
 
 		if info.ModTime().After(before) {
+			return nil
+		}
+
+		// An attempt that is still writing keeps its file, however old the last
+		// line in it is. Age is the wrong question for a service that has been
+		// up for a month.
+		if s.isOpen(path) {
 			return nil
 		}
 

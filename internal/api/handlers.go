@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -216,12 +217,32 @@ func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.scheduler.Submit(r.Context(), process); err != nil {
+	// The key is claimed before the work starts, never recorded after it. A
+	// client that timed out and retried is the case this exists for, and the
+	// first request is often still in flight when the second one arrives: both
+	// would otherwise look up the key, find nothing, and run the work twice.
+	claimed, err := s.claimIdempotent(r, key, body, process.ID)
+	if err != nil {
 		writeError(w, s.log, err)
 		return
 	}
 
-	s.rememberIdempotent(r, key, body, process.ID)
+	if claimed != nil {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, s.log, http.StatusOK, newCreateResponse(claimed))
+
+		return
+	}
+
+	if err := s.scheduler.Submit(r.Context(), process); err != nil {
+		// Nothing ran, so the key must not stay claimed: a queue that was full a
+		// moment ago is a reason to repeat the request, not to refuse it forever.
+		s.releaseIdempotent(r, key, process.ID)
+		writeError(w, s.log, err)
+
+		return
+	}
+
 	s.audit(r, "create", process.ID, process.Worker)
 
 	status := http.StatusCreated
@@ -283,6 +304,13 @@ func (s *Server) applyRawCommand(process *core.Process, req createProcessRequest
 		return fmt.Errorf("type %q: %w", req.Type, core.ErrRawCommandDenied)
 	}
 
+	// The fields below belong to a worker, and there is no worker here. Accepting
+	// them and dropping them would run something other than what was asked for,
+	// with no sign that anything was ignored.
+	if err := refuseWorkerFields(req); err != nil {
+		return err
+	}
+
 	process.Command = req.Command
 	process.Args = req.Args
 	process.Env = req.Env
@@ -291,6 +319,24 @@ func (s *Server) applyRawCommand(process *core.Process, req createProcessRequest
 	process.MaxAttempts = 1
 
 	return nil
+}
+
+// refuseWorkerFields rejects the parts of a submission that only a worker can
+// answer for, so a raw command never silently ignores half the request.
+func refuseWorkerFields(req createProcessRequest) error {
+	switch {
+	case req.Worker != "":
+		return badRequest("command_and_worker",
+			"command and worker are mutually exclusive: one names the work, the other chooses it")
+	case len(req.Params) > 0:
+		return badRequest("params_denied",
+			"params are declared by a worker, and a raw command declares none")
+	case req.Timeout != "":
+		return badRequest("timeout_denied",
+			"a timeout is an override a worker allows, and a raw command has no worker")
+	default:
+		return nil
+	}
 }
 
 // buildFromWorker resolves a request against a loaded worker. Everything that
@@ -563,14 +609,29 @@ func (s *Server) replayIdempotent(r *http.Request, key string, body []byte) (*co
 		return nil, fmt.Errorf("key %q: %w", key, core.ErrIdempotencyReuse)
 	}
 
-	return s.store.GetProcess(r.Context(), record.ProcessID)
+	replayed, err := s.store.GetProcess(r.Context(), record.ProcessID)
+
+	// A key replays for as long as its execution is retained. Once the history
+	// has been purged there is nothing left to replay, and the request is new
+	// again — answering "your own key is unknown" would refuse a request the
+	// client is entitled to make.
+	if errors.Is(err, core.ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return replayed, nil
 }
 
-// rememberIdempotent records the key so a client retry never starts the work
-// twice. A failure here is logged, not returned: the execution already exists.
-func (s *Server) rememberIdempotent(r *http.Request, key string, body []byte, processID string) {
+// claimIdempotent reserves the key for the execution about to be submitted, and
+// returns what a concurrent copy of the same request produced when it lost the
+// race.
+func (s *Server) claimIdempotent(r *http.Request, key string, body []byte, processID string) (*core.Process, error) {
 	if key == "" {
-		return
+		return nil, nil
 	}
 
 	err := s.store.SaveIdempotency(r.Context(), store.Idempotency{
@@ -579,8 +640,44 @@ func (s *Server) rememberIdempotent(r *http.Request, key string, body []byte, pr
 		ProcessID:   processID,
 		CreatedAt:   time.Now().UTC(),
 	})
+	if err == nil {
+		return nil, nil
+	}
+
+	if !errors.Is(err, core.ErrIdempotencyClaimed) {
+		return nil, err
+	}
+
+	replayed, err := s.replayIdempotent(r, key, body)
 	if err != nil {
-		s.log.Error("saving idempotency key", slog.String("key", key), slog.Any("error", err))
+		return nil, err
+	}
+
+	// The winner holds the key but has not recorded its execution yet, so there
+	// is nothing to hand back. Saying so is the whole point: starting the work
+	// again here is exactly what the key was sent to prevent.
+	if replayed == nil {
+		return nil, fmt.Errorf("key %q: %w", key, core.ErrIdempotencyInFlight)
+	}
+
+	return replayed, nil
+}
+
+// releaseIdempotent gives a claim back when the work it was taken for never
+// started. A failure here is logged, not returned: the client is already being
+// told why its request was refused.
+func (s *Server) releaseIdempotent(r *http.Request, key, processID string) {
+	if key == "" {
+		return
+	}
+
+	// Detached from the request: it may have been the cancellation of that
+	// request that refused the submission in the first place, and a claim left
+	// behind would refuse every later attempt to repeat it.
+	ctx := context.WithoutCancel(r.Context())
+
+	if err := s.store.DeleteIdempotency(ctx, key, processID); err != nil {
+		s.log.Error("releasing idempotency key", slog.String("key", key), slog.Any("error", err))
 	}
 }
 

@@ -23,27 +23,51 @@ func Delay(b config.Backoff, attempt int) time.Duration {
 	initial := b.Initial.Duration()
 	ceiling := b.Max.Duration()
 
-	var delay time.Duration
+	var grown float64
 
 	switch b.Type {
 	case config.BackoffFixed:
-		delay = initial
+		grown = float64(initial)
 	case config.BackoffLinear:
-		delay = time.Duration(attempt) * initial
+		grown = float64(attempt) * float64(initial)
 	default:
 		multiplier := b.Multiplier
 		if multiplier <= 0 {
 			multiplier = 2
 		}
 
-		delay = time.Duration(float64(initial) * math.Pow(multiplier, float64(attempt-1)))
+		grown = float64(initial) * math.Pow(multiplier, float64(attempt-1))
 	}
 
-	if ceiling > 0 && delay > ceiling {
-		delay = ceiling
+	// The curve is capped as a float, before it becomes a Duration.
+	//
+	// An exponential curve leaves the int64 range fast — five seconds doubling
+	// reaches it at attempt 32 — and converting an out-of-range float to a
+	// Duration yields a large negative number, which is not greater than the
+	// ceiling and so would slip past a check made afterwards. A negative delay
+	// puts retry_at in the past, and a service that has been crash-looping for
+	// an afternoon would come back as fast as the node can fork it.
+	return applyJitter(clamp(grown, ceiling), b.Jitter)
+}
+
+// clamp turns the grown curve into a duration, bounded by the ceiling and by
+// what a duration can hold. Every comparison happens in float64, so no
+// out-of-range value is ever converted.
+func clamp(grown float64, ceiling time.Duration) time.Duration {
+	if math.IsNaN(grown) || grown <= 0 {
+		return 0
 	}
 
-	return applyJitter(delay, b.Jitter)
+	limit := time.Duration(math.MaxInt64)
+	if ceiling > 0 {
+		limit = ceiling
+	}
+
+	if grown >= float64(limit) {
+		return limit
+	}
+
+	return time.Duration(grown)
 }
 
 func applyJitter(delay time.Duration, jitter float64) time.Duration {
@@ -51,16 +75,13 @@ func applyJitter(delay time.Duration, jitter float64) time.Duration {
 		return delay
 	}
 
-	// Spread uniformly over [delay*(1-jitter), delay*(1+jitter)].
+	// Spread uniformly over [delay*(1-jitter), delay*(1+jitter)]. The upper half
+	// of that window can leave the duration range when the delay already sits at
+	// its ceiling, so the result is clamped rather than converted blindly.
 	//nolint:gosec // spreading retries needs no cryptographic randomness
 	factor := 1 + jitter*(2*rand.Float64()-1)
 
-	jittered := time.Duration(float64(delay) * factor)
-	if jittered < 0 {
-		return 0
-	}
-
-	return jittered
+	return clamp(float64(delay)*factor, 0)
 }
 
 // Attempts returns how many attempts a worker is allowed to make in total, or

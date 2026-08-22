@@ -253,6 +253,99 @@ func TestStore_Purge(t *testing.T) {
 	}
 }
 
+// TestStore_Purge_keepsLiveAttempt pins the case retention gets wrong if it
+// only looks at modification times: a service that logged at start-up and has
+// been quiet ever since is older than the window and still running. Unlinking
+// its file costs every line it writes from then on.
+func TestStore_Purge_keepsLiveAttempt(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := New(root, 1024)
+
+	created := time.Now().UTC()
+
+	live, err := store.Create("proc_service", 1, created, Policy{MaxFiles: 3})
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	defer func() {
+		_ = live.Close()
+	}()
+
+	if _, err := live.Stdout.Write([]byte("service started\n")); err != nil {
+		t.Fatalf("Write() returned %v, want nil", err)
+	}
+
+	stale := time.Now().Add(-30 * 24 * time.Hour)
+
+	for _, stream := range []Stream{StreamStdout, StreamStderr} {
+		if err := os.Chtimes(store.Path("proc_service", 1, stream, created), stale, stale); err != nil {
+			t.Fatalf("ageing the log file: %v", err)
+		}
+	}
+
+	removed, err := store.Purge(time.Now().Add(-14 * 24 * time.Hour))
+	if err != nil {
+		t.Fatalf("Purge() returned %v, want nil", err)
+	}
+
+	if removed != 0 {
+		t.Errorf("purge removed %d files of a running attempt, want 0", removed)
+	}
+
+	if _, err := live.Stdout.Write([]byte("still alive\n")); err != nil {
+		t.Fatalf("Write() after the purge returned %v, want nil", err)
+	}
+
+	lines, err := store.Lines("proc_service", 1, StreamStdout, created, 0)
+	if err != nil {
+		t.Fatalf("Lines() returned %v, want nil", err)
+	}
+
+	if len(lines) != 2 {
+		t.Errorf("read back %d lines after the purge, want 2: %v", len(lines), lines)
+	}
+}
+
+// Once the attempt is closed, its files are ordinary history and retention owns
+// them again.
+func TestStore_Purge_collectsClosedAttempt(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := New(root, 1024)
+
+	created := time.Now().UTC()
+
+	attempt, err := store.Create("proc_task", 1, created, Policy{})
+	if err != nil {
+		t.Fatalf("Create() returned %v, want nil", err)
+	}
+
+	if err := attempt.Close(); err != nil {
+		t.Fatalf("Close() returned %v, want nil", err)
+	}
+
+	stale := time.Now().Add(-30 * 24 * time.Hour)
+
+	for _, stream := range []Stream{StreamStdout, StreamStderr} {
+		if err := os.Chtimes(store.Path("proc_task", 1, stream, created), stale, stale); err != nil {
+			t.Fatalf("ageing the log file: %v", err)
+		}
+	}
+
+	removed, err := store.Purge(time.Now().Add(-14 * 24 * time.Hour))
+	if err != nil {
+		t.Fatalf("Purge() returned %v, want nil", err)
+	}
+
+	if removed != 2 {
+		t.Errorf("purge removed %d files of a finished attempt, want 2", removed)
+	}
+}
+
 func TestStore_Purge_missingRoot(t *testing.T) {
 	t.Parallel()
 

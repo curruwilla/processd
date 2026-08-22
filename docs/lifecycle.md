@@ -91,8 +91,9 @@ and it only passes through `QUEUED` on the way back from a daemon restart it was
 * `processd stop <id>` / `DELETE /v1/processes/{id}` → `CANCELED`, `reason: user_request`, and
   **never** a retry.
 * An exit code in `no_retry_exit_codes` → `CRASHED`, then `FAILED` immediately.
-* A queue item over `queue.item_ttl` → `FAILED`, `reason: queue_timeout`. A service never expires
-  this way.
+* A queue item over `queue.item_ttl` → `FAILED`, `reason: queue_timeout`. The wait is counted from
+  when it entered the queue, so an execution returned there by `retry.on_shutdown` starts a fresh
+  one. A service never expires this way.
 
 Which of those send a notification is in [Notifications](notifications.md#events).
 
