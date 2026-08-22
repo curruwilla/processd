@@ -1,4 +1,5 @@
-# Example daemon configuration. See docs/SPEC.md §20 for every key.
+# Example daemon configuration.
+# Reference: docs/configuration.md (every key).
 listen: 127.0.0.1:7373
 data_dir: /var/lib/processd
 log_dir: /var/log/processd
@@ -32,7 +33,7 @@ logs:
   max_bytes_per_stream: 32MiB
   retention: 14d
 
-# Fallback notification policy (SPEC §5.5). A worker that declares `notify` of
+# Fallback notification policy (docs/notifications.md). A worker that declares `notify` of
 # its own replaces this one outright rather than merging with it.
 # notify:
 #   on: [retries_exhausted, timeout]
@@ -41,7 +42,7 @@ logs:
 #     timeout: 5s
 #     retry: 2
 
-# Reading other nodes turns this daemon into a hub (SPEC §6.10). It aggregates
+# Reading other nodes turns this daemon into a hub (docs/fleet.md). It aggregates
 # their read API and proxies reads to them, and never writes to one. Nothing is
 # configured on the nodes themselves: the hub polls, so a node does not know it
 # is being read. Leave this out on an ordinary node — the fleet routes are then

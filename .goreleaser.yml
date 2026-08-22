@@ -38,6 +38,7 @@ archives:
     files:
       - README.md
       - LICENSE
+      - docs
       - examples
 
 nfpms:

@@ -4,6 +4,13 @@ Lightweight process manager written in Go: runs and supervises CLI processes thr
 The specification in `docs/SPEC.md` is the authority — when code and spec disagree, one of them is a
 bug, so fix both in the same change.
 
+## Documentation
+
+`README.md` is a landing page only: pitch, one install snippet, a link table, roadmap. Every detail
+lives in `docs/`, one page per part of the program (`docs/README.md` is the index). A behaviour
+change updates the page that documents it in the same commit. `README.pt-BR.md` is a full PT-BR
+mirror of the pre-split README and is not part of that split.
+
 ## Language
 
 This is a global open-source project. **Every artifact is written in English**: code, identifiers,

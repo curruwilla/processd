@@ -1,6 +1,7 @@
 # Example notification target. A worker named by `notify.exec` receives the
 # outcome through declared params, like every other execution: nothing reaches a
 # process that the worker did not declare, notifications included.
+# Reference: docs/notifications.md.
 #
 # The values a notification can carry are:
 #   event        failed | crashed | retries_exhausted | timeout

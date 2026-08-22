@@ -19,4 +19,6 @@ coverage.*
 /.vscode/
 *.swp
 
-docs
+# PT-BR working specification, kept out of the repository until the English
+# version replaces it.
+/docs/SPEC.md

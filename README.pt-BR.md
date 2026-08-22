@@ -11,6 +11,10 @@ um binário, um arquivo de configuração, uma API. Fica no espaço entre superv
 **Status: alpha.** O MVP está completo — o daemon executa, supervisiona, persiste e recupera
 processos de verdade — mas ainda não foi usado em produção. Trate a primeira instalação como piloto.
 
+Este arquivo é a referência completa em português, em uma página só. A mesma documentação
+dividida por assunto — instalação, workers, agendamento, notificações, CLI, API, fleet, operação —
+está em [`docs/`](docs/README.md), em inglês.
+
 ## O que faz
 
 * Executa processos CLI por uma REST API, com argumentos validados e sem shell no caminho.
@@ -978,10 +982,6 @@ As fases 5 e 6 são locais: não precisam de uma segunda máquina e não mudam n
 endereçado. A fase 7 só lê, então um hub fora do ar deixa todos os nodes rodando exatamente como
 estavam, e a fase 8 escreve apenas no node que um cliente nomeou.
 
-**Scheduling distribuído é não-objetivo, não uma fase futura.** Placement automático, least-loaded,
-constraints, réplicas, failover entre nodes e locks distribuídos ficam ao lado do Raft em
-[`docs/SPEC.md`](docs/SPEC.md) §2.2 — uma decisão, não um item de backlog. O raciocínio está na §22.
-
 ---
 
 ## Desenvolvimento
@@ -1028,7 +1028,8 @@ e a assinatura cosign dele.
 git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 ```
 
-Exemplos de configuração e unit systemd em [`examples/`](examples/).
+Exemplos de configuração e unit systemd em [`examples/`](examples/), comentados um a um em
+[`docs/examples.md`](docs/examples.md).
 
 ## Licença
 

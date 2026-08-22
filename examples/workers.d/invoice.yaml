@@ -1,5 +1,6 @@
-# Example worker. Arguments reach the process only through declared params,
-# validated by pattern or enum before anything is executed (docs/SPEC.md §5.3).
+# Example task worker. Arguments reach the process only through declared params,
+# validated by pattern or enum before anything is executed.
+# Reference: docs/workers.md, docs/retry.md.
 version: 1
 workers:
   - name: invoice-process

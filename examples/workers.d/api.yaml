@@ -1,6 +1,7 @@
 # Example service. A service is not expected to terminate: any exit is abnormal
-# and is followed by a restart, which is the opposite of a task (docs/SPEC.md
-# §4). The restart policy is mostly defaults; only log rotation must be stated.
+# and is followed by a restart, which is the opposite of a task. The restart
+# policy is mostly defaults; only log rotation must be stated.
+# Reference: docs/services.md, docs/retry.md.
 version: 1
 workers:
   - name: api

@@ -1,6 +1,6 @@
 # Example scheduled worker. The daemon fires it on its own, so there is no
-# crontab entry holding an API token and no external caller to lose
-# (docs/SPEC.md §22.1).
+# crontab entry holding an API token and no external caller to lose.
+# Reference: docs/scheduling.md, docs/notifications.md.
 version: 1
 workers:
   - name: nightly-report
@@ -60,7 +60,7 @@ workers:
         jitter: 0.2
 
     # Who to tell when it ends badly. Without this a failed task is silent until
-    # somebody opens the console (docs/SPEC.md §22.2).
+    # somebody opens the console (docs/notifications.md).
     notify:
       # crashed = an attempt failed and another follows.
       # failed / retries_exhausted / timeout = it is over.
