@@ -21,6 +21,11 @@ processes — but it has not been used in production yet. Treat the first instal
 * Captures stdout and stderr per attempt, with the exit code and terminating signal, and streams
   the output live.
 * Applies timeouts, retry with backoff and locks against concurrent runs.
+* Fires a worker on its own cron schedule, reports the next run, and records the occurrences it
+  missed while it was down.
+* Tells somebody when an execution ends badly, through a webhook or by running another worker.
+* Reads other nodes — one console, one `ps`, log streams proxied — and runs work on the one you
+  name, without ever choosing that node for you.
 * Persists state in SQLite and reconciles what it finds after a restart.
 * Exposes Prometheus metrics, per-execution CPU and memory, and an embedded web console.
 * Shuts the daemon and the whole process tree down gracefully.
@@ -477,10 +482,17 @@ gives you.
 | `history.max_rows` | int | `500000` | ceiling of retained rows |
 | `logs.max_bytes_per_stream` | byte size > 0 | `32MiB` | cap per stream per attempt; reaching it marks `log_truncated` |
 | `logs.retention` | duration | `14d` | GC of log files |
+| `notify` | object | none | the fallback notification policy, in the same shape a worker uses. A worker that declares its own replaces it |
+| `fleet.nodes[].name` | string | — required | unique; how the node is named in every fleet answer |
+| `fleet.nodes[].url` | URL | — required | `http` or `https`, with a host |
+| `fleet.nodes[].token_file` | path | — required | absolute path to a **read-only** token for that node. There is deliberately no inline token: this file stores digests, never secrets |
+| `fleet.poll_interval` | duration > 0 | `10s` | how often each node is asked how it is doing |
+| `fleet.timeout` | duration > 0 | `5s` | bounds one call to one node |
 | `ui.enabled` | bool | `true` | the web console at `/ui/` |
 | `auth.tokens[].name` | string | — required | identifies the token in the audit trail |
 | `auth.tokens[].hash` | string | — required | `sha256:...` from `processd setup` or `processd token hash` |
 | `auth.tokens[].workers` | list | `[]` = all | restricts the token to specific workers |
+| `auth.tokens[].read_only` | bool | `false` | refuses every state-changing call with this token. What a hub uses to read a node, and what a dashboard should get |
 
 ## Worker definition
 
@@ -532,6 +544,8 @@ workers:
 | `lock_conflict` | enum | `queue` | `queue` waits for the lock; `reject` answers `409` immediately |
 | `overridable` | list of enum | `[]` | what a request may override: `env`, `timeout`, `lock`. Anything else → `400` |
 | `retry` | object | off | table below |
+| `schedule` | object | none | fires the worker on its own; table below. Refused on a `service` — a service is already meant to be running |
+| `notify` | object | the daemon-wide `notify`, if any | who to tell when an execution ends badly; table below |
 | `logs.max_bytes_per_stream` | byte size | the daemon value (`32MiB`) | cap per stream per attempt; retention belongs to the daemon |
 | `logs.rotate.max_files` | int ≥ 0 | `0` = no rotation | how many rotated files to keep behind the live one. Without rotation the stream stops storing once the cap is full — **mandatory for a `service`** |
 
@@ -581,6 +595,146 @@ Curves: `fixed` = `initial`; `linear` = `initial × attempt`; `exponential` =
 The lock is held across a retry: releasing it during the backoff would let another execution take it
 mid-retry.
 
+### `schedule`
+
+A scheduled worker is fired by the daemon that runs it. There is no crontab entry holding an API
+token, and no external caller whose absence is invisible.
+
+```yaml
+- name: nightly-report
+  command: /usr/bin/php
+  args: [/var/www/app/artisan, report:build, "--range={{range}}"]
+  params:
+    range: { enum: [daily, weekly], default: daily }
+  lock_conflict: reject           # skip a firing while the previous one still runs
+  schedule:
+    cron: "15 3 * * *"
+    timezone: America/Sao_Paulo
+    catch_up: false
+    jitter: 90s
+```
+
+| Key | Type | Default | Values and rules |
+|---|---|---|---|
+| `cron` | string | — required | five fields, `minute hour day-of-month month day-of-week`, or one of `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. Without it, the other keys are a typo and **fail the load** |
+| `timezone` | IANA zone | `UTC` | never the host zone: the same file has to describe the same instants on every node |
+| `catch_up` | bool | `false` | `false` records the occurrences missed while the daemon was down and moves on. `true` runs the **most recent** missed occurrence once — never one per occurrence |
+| `jitter` | duration | `0` | spreads the firing randomly over `[0, jitter]`, so a fleet sharing a schedule does not hit the same dependency at the same second |
+
+Expression syntax: `*`, `5`, `1-5`, `*/15`, `1-5/2`, `5/20` (every 20th from 5), and comma-separated
+lists of any of those. Month and weekday accept three-letter names (`jan`, `fri`); Sunday is both `0`
+and `7`. When **both** day fields are restricted they are combined with OR, not AND — the Vixie rule,
+so `0 0 20 * fri` means "the 20th, and every Friday".
+
+Rules that fail the load rather than the firing:
+
+* Every param must be answerable without a request. A `required: true` param on a scheduled worker is
+  refused — a firing sends no params, so give it a `default` or drop the requirement.
+* A `service` cannot be scheduled.
+* A broken expression or an unknown zone fails the reload that introduced it, not the tick at 03:00
+  that nobody is watching.
+
+Overlap is not a separate knob. A scheduled worker with no `lock` of its own gets `schedule:<name>`,
+and `lock_conflict` decides what the next firing does while the previous one is still running:
+`queue` waits its turn, `reject` refuses it and records a `CANCELED` execution with
+`reason: lock_conflict`. Either way the firing is in the history.
+
+**Daylight saving time** is arithmetic, not a special case, and the two directions differ on purpose:
+
+* *Spring forward* — the wall clock never shows the skipped hour, so a schedule inside it does not
+  fire that day. It is skipped, not moved.
+* *Fall back* — the repeated hour would hand the same local time to two instants, so the second is
+  skipped. `03:00 daily` means one firing that day.
+
+What a firing carries: the execution is created from the current worker definition with no params
+beyond their defaults, and its `metadata` records `processd.trigger: schedule` and
+`processd.occurrence`, the scheduled instant it belongs to. That instant is not the creation time —
+jitter and dispatch delay move the second, never the grid.
+
+`processd workers` and `GET /v1/workers` report `next_run`, `last_fired_at` and `missed_runs`. A
+schedule whose next firing nobody can see is the crontab entry this replaced.
+
+### `notify`
+
+A failed execution is otherwise silent unless somebody is watching the console or a Prometheus rule
+is already written. This is the hole every wrapper script was written to fill.
+
+```yaml
+- name: nightly-report
+  command: /usr/bin/php
+  notify:
+    on: [retries_exhausted, timeout]
+    webhook:
+      url: https://hooks.example.com/processd
+      timeout: 5s
+      retry: 2
+      headers: { X-Processd-Channel: incidents }
+    exec:
+      worker: notify-slack
+```
+
+A worker with no `notify` of its own uses the daemon-wide one from `processd.yaml`, which has the
+same shape. A worker that declares one **replaces** it outright rather than merging — two
+half-policies deciding one delivery is harder to read than either of them.
+
+| Key | Type | Default | Values and rules |
+|---|---|---|---|
+| `on` | list of enum | — required whenever anything else is set | `failed`, `crashed`, `retries_exhausted`, `timeout` |
+| `webhook.url` | URL | — | `http` or `https`, with a host. Anything else fails the load |
+| `webhook.method` | string | `POST` | |
+| `webhook.headers` | map | `{}` | sent as written; `Content-Type: application/json` is always set |
+| `webhook.timeout` | duration | `5s` | bounds one attempt. Must be greater than zero |
+| `webhook.retry` | int ≥ 0 | `0` | extra attempts after a failure, 2s apart |
+| `webhook.include_log_tail` | int ≥ 0 | `0` = none | last N lines of the attempt's output. **Off by default and opt-in on purpose** — logs carry secrets far more often than anyone intends |
+| `exec.worker` | worker name | — | runs that worker; see below |
+
+**The events do not overlap.** One outcome sends exactly one notification, and the daemon picks which:
+
+| Event | Means |
+|---|---|
+| `crashed` | an attempt ended badly and **another will follow** |
+| `timeout` | it is over, and the last attempt was killed by its own deadline |
+| `retries_exhausted` | it is over, and a retry policy spent its budget |
+| `failed` | it is over, with no retry policy to spend — including `no_retry_exit_codes` |
+
+Nothing is sent for a success, for `DELETE /v1/processes/{id}`, or for a shutdown: a human who
+stopped an execution already knows.
+
+`exec.worker` runs a worker instead of, or as well as, the webhook. It obeys the same rule as every
+other execution — **nothing reaches a process that the worker did not declare**. The outcome is
+offered as params, and only the ones the target declares are passed:
+
+```
+event  process_id  worker  state  reason  attempt  exit_code  signal  node
+```
+
+Rules that fail the load rather than the failure they were meant to report: the target must exist
+(in any file), must be a `task`, must not declare `notify` of its own — a notifier that notifies
+about its own failure is a loop with no bound — and must not `require` a param outside that list.
+
+**What the payload carries**, and deliberately does not: identity, outcome, timing, and the
+`metadata` a client put there itself. There is no environment, no command and no argument list. The
+daemon environment holds secrets by design, and a webhook is the one place they would leave the node.
+
+```json
+{
+  "event": "retries_exhausted",
+  "node": "app-01",
+  "sent_at": "2026-08-22T00:30:58Z",
+  "process": {
+    "id": "proc_01M0KE1F77NPXZAG15REPZVJC7", "worker": "nightly-report", "type": "task",
+    "state": "FAILED", "reason": "max_attempts", "attempt": 3, "restarts": 0,
+    "exit_code": 7, "metadata": {"invoice": "42"},
+    "created_at": "...", "started_at": "...", "finished_at": "...", "duration_ms": 812
+  }
+}
+```
+
+Delivery is **best effort, and never touches the execution it describes**. A notification that
+cannot be delivered is logged and dropped; it never fails, delays or retries the work. The queue is
+bounded, so a node whose workers are all failing does not grow a notification backlog on top of the
+incident, and shutdown waits at most 5s for what is queued.
+
 ## Lifecycle
 
 ```
@@ -614,13 +768,14 @@ variable (`--log-level` → `PROCESSD_LOG_LEVEL`).
 | `processd setup [--dry-run] [--rotate-token] [--listen addr] [--systemd=false] [--start=false] [--output json]` | installs the node: directories, configuration, token, systemd unit, and prints all of it |
 | `processd serve --config <path>` | runs the daemon |
 | `processd status` | health, version, slots, running and queued |
-| `processd ps [--status S] [--type task\|service] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lists executions |
-| `processd run <worker> [--param name=value] [--lock k]` | creates an execution |
-| `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f]` | captured output, `-f` streams it |
-| `processd stop <id> [--grace 15s]` | `SIGTERM` to the group, `SIGKILL` after the grace |
-| `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m]` | stops it and creates a new execution from the current worker definition |
-| `processd signal <id> <SIGNAL>` | sends an allowlisted signal to the group |
-| `processd workers` | loaded workers, with their declared params |
+| `processd ps [--status S] [--type task\|service] [--worker w] [--node n\|*] [--limit n] [--cursor c] [--output table\|json]` | lists executions; `--node` reads a fleet node instead of this one |
+| `processd run <worker> [--param name=value] [--lock k] [--node n]` | creates an execution; `--node` runs it on that fleet node |
+| `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f] [--node n]` | captured output, `-f` streams it |
+| `processd stop <id> [--grace 15s] [--node n]` | `SIGTERM` to the group, `SIGKILL` after the grace |
+| `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m] [--node n]` | stops it and creates a new execution from the current worker definition |
+| `processd signal <id> <SIGNAL> [--node n]` | sends an allowlisted signal to the group |
+| `processd workers` | loaded workers, with their declared params, cron expression and next run |
+| `processd fleet [--output table\|json]` | on a hub: every node it reads, with the reason for any that is unreachable |
 | `processd reload` | re-reads `workers.d` |
 | `processd token hash` | reads a token from stdin and prints the configuration digest |
 
@@ -635,14 +790,14 @@ Base `/v1`, JSON in and out. Every endpoint needs `Authorization: Bearer <token>
 
 | Endpoint | Notes |
 |---|---|
-| `POST /v1/processes` | `{"worker":"...","params":{...}}`. `201` admitted, `202` queued. An optional `Idempotency-Key` replays the original response with `Idempotent-Replay: true` for as long as that execution is retained; the same key with a different body → `409` |
+| `POST /v1/processes` | `{"worker":"...","params":{...}}`. `201` admitted, `202` queued. An optional `Idempotency-Key` replays the original response with `Idempotent-Replay: true` for as long as that execution is retained; the same key with a different body → `409`. On a hub, an optional `node` dispatches it there instead |
 | `GET /v1/processes` | filters: `status` (repeatable), `type`, `worker`, `lock`, `created_after`, `created_before`; `limit` default 50, max 500; cursor paging |
 | `GET /v1/processes/{id}` | full representation, including live CPU and memory while it runs |
 | `DELETE /v1/processes/{id}?grace=15s` | `CANCELED` with `reason: user_request`, and **never** triggers a retry |
 | `POST /v1/processes/{id}/signal` | `{"signal":"SIGUSR1"}` |
 | `GET /v1/processes/{id}/logs` | `?stream=stdout\|stderr\|both&attempt=N&tail=N` |
 | `GET /v1/processes/{id}/logs/stream` | Server-Sent Events, one `line` event per line, `end` when the attempt finishes |
-| `GET /v1/workers` | workers the token may see |
+| `GET /v1/workers` | workers the token may see; a scheduled one carries `schedule` with `cron`, `timezone`, `next_run`, `last_fired_at`, `last_missed_at` and `missed_runs` |
 | `POST /v1/reload` | re-reads `workers.d`, all-or-nothing |
 | `GET /v1/health[?deep=1]` | public; `deep` also pings the store |
 | `GET /v1/stats` | slots, queue depth, states, service counters |
@@ -653,12 +808,115 @@ Errors always look the same: `{"error":{"code":"param_invalid","message":"...","
 | Status | When |
 |---|---|
 | `400` | invalid payload, invalid or undeclared param, unsupported `type`, signal outside the allowlist |
-| `401` / `403` | no valid token / token not allowed for that worker, or a raw command in `workers` mode |
+| `401` / `403` | no valid token / token not allowed for that worker, a read-only token on a state-changing call, or a raw command in `workers` mode |
 | `404` | unknown worker or execution |
 | `409` | lock held with `lock_conflict: reject`, signal on a non-running execution, idempotency key reused with a different body |
 | `422` | worker disabled |
 | `429` | queue full (`queue.max_depth`) |
 | `503` | daemon shutting down, or a service with no free slot (`no_capacity`) |
+| `504` | a hub dispatched to a node that did not answer (`dispatch_unknown`). **Not a failure** — the execution may be running; retry with the same `Idempotency-Key` |
+
+## Fleet
+
+A **hub** is an ordinary processd that also reads other nodes. It aggregates their read API and
+proxies reads to them, and it **never writes to one**.
+
+```yaml
+# /etc/processd/processd.yaml, on the hub only
+fleet:
+  poll_interval: 10s
+  nodes:
+    - name: app-01
+      url: https://10.0.0.11:7373
+      token_file: /etc/processd/nodes/app-01.token
+    - name: app-02
+      url: https://10.0.0.12:7373
+      token_file: /etc/processd/nodes/app-02.token
+```
+
+```bash
+processd fleet                    # every node: reachable, version, slots, running, queued, last seen
+processd ps --node app-01         # that node's executions, with its own paging
+processd ps --node '*'            # newest across every node, merged
+```
+
+The console gains a **Fleet** tab and a node selector on the processes view, both of which stay
+hidden on a daemon that aggregates nothing.
+
+**Nothing is configured on the node.** The hub polls; there is no registration protocol and no
+hub-side state on the node, so a node does not know it is being read and needs no change to join a
+fleet. That simplification is only available because the aggregation never writes.
+
+| Endpoint | Notes |
+|---|---|
+| `GET /v1/fleet/nodes` | the last poll of every node: `reachable`, `version`, `last_seen`, `stats`, and `error` when it is not answering |
+| `GET /v1/fleet/nodes/{node}/{path...}` | proxies any read to that node's `/v1/{path}`, including `logs/stream`. Streams as it arrives; a path that climbs out of `/v1` is refused |
+| `GET /v1/processes?node=app-01` | that node's listing, with its own cursor |
+| `GET /v1/processes?node=*` | newest first across every node, each row tagged with `node` |
+| `POST /v1/processes` with `"node"` | dispatches to that node; the answer is the node's own, plus `X-Processd-Node`. `504 dispatch_unknown` when the node did not answer |
+| `POST`/`DELETE /v1/fleet/nodes/{node}/{path...}` | forwards a write to the node the client named. The node applies its own rules to the hub's token, so a `read_only` one refuses it |
+
+On a daemon with no `fleet`, those routes **do not exist** — the absence is the statement that there
+is no fleet, rather than an empty list that looks like a broken one.
+
+Things worth knowing before relying on it:
+
+* **A hub being down changes nothing.** Every node keeps running, supervising and retrying exactly as
+  it was. The worst case is a stale panel.
+* **The token is the hub's, never the caller's.** A client authenticates to the hub; the hub
+  authenticates to each node with the token from `token_file`, which it re-reads on every poll — so
+  rotating a node's token takes effect within one interval, not at the next restart. Give the hub a
+  `read_only: true` token, and the node will refuse a write even if the hub is ever asked to make one.
+* **One unreachable node degrades the answer, never fails it.** A merged listing returns what the
+  live nodes had and names the ones that did not answer in `unreachable`; a node status keeps its last
+  known numbers next to the reason it is now unreachable.
+* **A merged page has no cursor.** There is no ordering across nodes to page through, and inventing
+  one would be a distributed index nobody asked for. Page deeper by naming a single node.
+* **Version skew is expected.** Node answers are decoded loosely, so a counter or a field from a
+  newer node is passed through rather than dropped.
+* **Logs are proxied, never copied.** The output stays on the node that produced it.
+
+### Running work on a node
+
+Every command that acts on one execution takes `--node`, and the hub forwards it to the node that was
+named. **The client chooses the node; the hub never does.**
+
+```bash
+processd run sleeper --node app-01
+processd logs <id> --node app-01 -f
+processd signal <id> SIGUSR1 --node app-01
+processd stop <id> --node app-01
+processd restart <id> --node app-01
+```
+
+Over the API, that is `POST /v1/processes` with a `node` field, or any method against
+`/v1/fleet/nodes/{node}/{path...}`. The `node` field is stripped before the body reaches the node,
+which has no idea what a fleet is.
+
+Three things make this a router and not a scheduler:
+
+* **The execution lives only on the node.** The hub keeps no copy of what it forwarded, so its own
+  `processd ps` stays empty. There is nothing to reconcile, and therefore nothing to reconcile wrongly.
+* **`node` is never inferred.** Without it the execution is local and explicit; the hub does not
+  "pick one".
+* **Silence is not a failure.** A node that did not answer has not said no — the execution may be
+  running right now. The hub answers `504` with `dispatch_unknown` and tells you to retry with the
+  same `Idempotency-Key`, and it never marks anything failed or reschedules it anywhere.
+
+**Whether a hub may write at all is your decision, and you make it with a token.** Install a
+`read_only: true` token for a node and that node refuses every write from the hub, whatever the hub is
+asked to do:
+
+```console
+$ processd run sleeper --node app-02
+error: read_only_token: token "hub" is read-only and may not POST
+```
+
+The `Idempotency-Key` is the client's, forwarded as sent, not one the hub invents: the hub answers
+`dispatch_unknown` and stops, so the client is the one that retries and the key has to be stable
+across its retries.
+
+**Distributed scheduling is not part of this and is not coming** — see the roadmap.
 
 ## Metrics
 
@@ -710,13 +968,14 @@ process group, and nothing runs as root without an explicit opt-in.
 | 2 ✅ | supervisor: queue, locks, retry/backoff, timeout, recovery | — |
 | 3 ✅ | observability: metrics, log streaming, CPU/memory, web console | — |
 | 4 ✅ | `type: service`: continuous restart and log rotation | — |
-| 5 | scheduled triggers: `schedule` on a worker, a visible next run, an overlap policy | — |
-| 6 | failure notifications: a webhook or a worker call on failure, crash or exhausted retries | — |
-| 7 | fleet view: read-only aggregation of several nodes, one console, log streams proxied | — |
-| 8 | explicit remote dispatch: start an execution on a node the client names | 7 |
+| 5 ✅ | scheduled triggers: `schedule` on a worker, a visible next run, an overlap policy | — |
+| 6 ✅ | failure notifications: a webhook or a worker call on failure, crash or exhausted retries | — |
+| 7 ✅ | fleet view: read-only aggregation of several nodes, one console, log streams proxied | — |
+| 8 ✅ | explicit remote dispatch: start an execution on a node the client names | 7 |
 
-Phases 5 and 6 are local and independent of each other, so they can land in any order. Phase 7 reads
-other nodes and never writes to them: a hub that is down leaves every node running.
+Phases 5 and 6 are local: they need no second machine and change nothing about how a node is
+addressed. Phase 7 only reads, so a hub that is down leaves every node running exactly as it was, and
+phase 8 writes only to the node a client named.
 
 **Distributed scheduling is a non-goal, not a later phase.** Automatic placement, least-loaded,
 constraints, replicas, failover between nodes and distributed locks sit next to Raft in

@@ -18,7 +18,10 @@ const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
   view: 'overview',
   cursor: '',
-  filters: { state: '', type: '', worker: '' },
+  filters: { state: '', type: '', worker: '', node: '' },
+  // nodes is empty on an ordinary node: the fleet routes are absent there, and
+  // their absence is what hides the tab.
+  nodes: [],
   selected: null,
   stream: null,
   workers: [],
@@ -133,6 +136,7 @@ function elapsed(item) {
 
 function processRow(item, columns) {
   const row = document.createElement('tr');
+  if (columns.node) row.append(cell(item.node || '—', ''));
   row.append(cell(short(item.id), 'id'));
   row.append(cell(item.worker || item.command, ''));
   row.append(cell(item.type, 'kind kind-' + item.type));
@@ -234,6 +238,7 @@ function processQuery() {
   if (state.filters.state) params.set('status', state.filters.state);
   if (state.filters.type) params.set('type', state.filters.type);
   if (state.filters.worker) params.set('worker', state.filters.worker);
+  if (state.filters.node) params.set('node', state.filters.node);
   if (state.cursor) params.set('cursor', state.cursor);
   return params.toString();
 }
@@ -244,8 +249,17 @@ async function loadProcesses(append) {
   const page = await request('processes?' + processQuery());
   const body = el('processes').querySelector('tbody');
 
+  const withNode = Boolean(state.filters.node);
+  el('processes-node-head').hidden = !withNode;
+
   if (!append) body.textContent = '';
-  for (const item of page.items) body.append(processRow(item, { pid: true, restarts: true }));
+  for (const item of page.items) body.append(processRow(item, { pid: true, restarts: true, node: withNode }));
+
+  // A degraded page has to say so: rows missing because a node did not answer
+  // look exactly like rows that do not exist.
+  if (page.unreachable && page.unreachable.length) {
+    fail(new Error('unreachable nodes: ' + page.unreachable.join(', ')));
+  }
 
   state.cursor = page.next_cursor || '';
   el('load-more').hidden = !state.cursor;
@@ -266,6 +280,7 @@ async function loadWorkers() {
     row.append(cell(worker.enabled ? 'yes' : 'no', ''));
     row.append(cell(worker.command, 'id'));
     row.append(cell(worker.max_processes || '—', ''));
+    row.append(scheduleCell(worker.schedule));
     row.append(cell(Object.keys(worker.params || {}).join(', ') || '—', ''));
 
     const action = document.createElement('td');
@@ -276,6 +291,90 @@ async function loadWorkers() {
     button.addEventListener('click', () => openRun(worker));
     action.append(button);
     row.append(action);
+
+    body.append(row);
+  }
+}
+
+// A schedule is only useful if the next firing is visible: an expression on its
+// own is what a crontab already showed, and told nobody when it would run.
+function scheduleCell(schedule) {
+  if (!schedule) return cell('—', '');
+
+  const td = document.createElement('td');
+
+  const expression = document.createElement('div');
+  expression.className = 'id';
+  expression.textContent = schedule.cron;
+  td.append(expression);
+
+  const detail = document.createElement('div');
+  detail.className = 'hint';
+  detail.textContent = schedule.next_run ? 'next ' + when(schedule.next_run) : 'no upcoming run';
+  td.append(detail);
+
+  // A missed occurrence is a fact about the node, not a gap in a chart.
+  if (schedule.missed_runs) {
+    const missed = document.createElement('div');
+    missed.className = 'hint';
+    missed.textContent = schedule.missed_runs + ' missed';
+    td.append(missed);
+  }
+
+  return td;
+}
+
+// -------------------------------------------------------------------- fleet
+
+// discoverFleet asks once whether this daemon is a hub. The routes are absent
+// on an ordinary node, so a 404 is the answer and not an error.
+async function discoverFleet() {
+  try {
+    state.nodes = await request('fleet/nodes') || [];
+  } catch (ignored) {
+    state.nodes = [];
+  }
+
+  const isHub = state.nodes.length > 0;
+  el('tab-fleet').hidden = !isHub;
+  el('filter-node-wrap').hidden = !isHub;
+
+  if (!isHub) return;
+
+  const select = el('filter-node');
+  for (const node of state.nodes) {
+    if (select.querySelector('option[value="' + CSS.escape(node.name) + '"]')) continue;
+    const option = document.createElement('option');
+    option.value = node.name;
+    option.textContent = node.name;
+    select.append(option);
+  }
+}
+
+async function loadFleet() {
+  state.nodes = await request('fleet/nodes') || [];
+
+  const body = el('fleet').querySelector('tbody');
+  body.textContent = '';
+
+  for (const node of state.nodes) {
+    const row = document.createElement('tr');
+    row.style.cursor = 'default';
+    row.append(cell(node.name, ''));
+
+    // The reason belongs next to the answer: "no" with no cause sends the
+    // operator to the logs of a node that is, by definition, not answering.
+    const reachable = cell(node.reachable ? 'yes' : 'no', node.reachable ? '' : 'state state-FAILED');
+    if (!node.reachable && node.error) reachable.title = node.error;
+    row.append(reachable);
+
+    const stats = node.stats || {};
+    row.append(cell(node.version ? 'v' + node.version : '—', ''));
+    row.append(cell(stats.slots_used === undefined ? '—' : stats.slots_used + ' / ' + stats.slots_max, ''));
+    row.append(cell(stats.running === undefined ? '—' : String(stats.running), ''));
+    row.append(cell(stats.queue_depth === undefined ? '—' : String(stats.queue_depth), ''));
+    row.append(cell(node.last_seen ? when(node.last_seen) : 'never', ''));
+    row.append(cell(node.url, 'id'));
 
     body.append(row);
   }
@@ -568,7 +667,7 @@ function show(view) {
     tab.classList.toggle('active', tab.dataset.view === view);
   }
 
-  for (const name of ['overview', 'processes', 'workers']) {
+  for (const name of ['overview', 'processes', 'workers', 'fleet']) {
     el('view-' + name).hidden = name !== view;
   }
 
@@ -585,6 +684,7 @@ async function refresh() {
     if (state.view === 'overview') await loadOverview();
     if (state.view === 'processes') await loadProcesses(false);
     if (state.view === 'workers') await loadWorkers();
+    if (state.view === 'fleet') await loadFleet();
     if (state.selected) await refreshDrawer();
     clearFail();
   } catch (err) {
@@ -600,6 +700,9 @@ function wire() {
     event.preventDefault();
     state.token = el('token').value.trim();
     localStorage.setItem(TOKEN_KEY, state.token);
+    // Discovery needs the token: at boot there may not have been one yet, and a
+    // hub would otherwise stay hidden until the page is reloaded.
+    discoverFleet().catch(() => {});
     refresh().catch(() => {});
   });
 
@@ -621,6 +724,7 @@ function wire() {
       state: states.value,
       type: el('filter-type').value,
       worker: el('filter-worker').value.trim(),
+      node: el('filter-node').value,
     };
     loadProcesses(false).catch(fail);
   });
@@ -647,4 +751,5 @@ function wire() {
 }
 
 wire();
+discoverFleet().catch(() => {});
 show('overview');

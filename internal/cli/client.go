@@ -221,6 +221,19 @@ func apiFailure(resp *http.Response) error {
 	return &apiError{code: body.Error.Code, message: body.Error.Message}
 }
 
+// nodePath routes a call at a fleet node instead of this one.
+//
+// It is a prefix and nothing else: the hub forwards what it is given to the node
+// that was named, so a command reads the same whether or not there is a fleet
+// behind it.
+func nodePath(node, path string) string {
+	if node == "" {
+		return path
+	}
+
+	return "/v1/fleet/nodes/" + url.PathEscape(node) + strings.TrimPrefix(path, "/v1")
+}
+
 // query builds a path with an encoded query string.
 func query(path string, values url.Values) string {
 	if len(values) == 0 {

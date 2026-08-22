@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/curruwilla/processd/internal/config"
+	"github.com/curruwilla/processd/internal/fleet"
 	"github.com/curruwilla/processd/internal/logstore"
 	"github.com/curruwilla/processd/internal/metrics"
 	"github.com/curruwilla/processd/internal/queue"
+	"github.com/curruwilla/processd/internal/schedule"
 	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/supervisor"
 )
@@ -35,6 +37,14 @@ type Server struct {
 	auth       *authenticator
 	log        *slog.Logger
 
+	// schedules answers what a worker's cron expression will do next. It is nil
+	// only in tests that do not wire the runner.
+	schedules ScheduleReporter
+
+	// fleet reads other nodes. It is nil on an ordinary single node, which is
+	// what keeps the fleet routes off the tree entirely.
+	fleet *fleet.Fleet
+
 	// ui serves the built-in console, or is nil when it is turned off.
 	ui http.Handler
 
@@ -52,9 +62,17 @@ type Options struct {
 	Metrics    *metrics.Registry
 	Logger     *slog.Logger
 	Reload     func(context.Context) error
+	Schedules  ScheduleReporter
+	Fleet      *fleet.Fleet
 
 	// UI is the console handler, mounted under /ui. A nil handler disables it.
 	UI http.Handler
+}
+
+// ScheduleReporter answers what is known about a worker's schedule. The API
+// reads it; only the runner writes it.
+type ScheduleReporter interface {
+	Status(worker string) (schedule.Status, bool)
 }
 
 // New wires the API server.
@@ -76,6 +94,8 @@ func New(opts Options) *Server {
 		auth:       newAuthenticator(opts.Config.Auth.Tokens),
 		log:        opts.Logger,
 		reload:     opts.Reload,
+		schedules:  opts.Schedules,
+		fleet:      opts.Fleet,
 		ui:         opts.UI,
 	}
 }

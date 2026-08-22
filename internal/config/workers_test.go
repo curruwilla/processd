@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -342,5 +343,285 @@ func TestApplyWorkerDefaults_TaskUnchanged(t *testing.T) {
 
 	if !slices.Equal(worker.Retry.SuccessExitCodes, []int{0}) {
 		t.Errorf("retry.success_exit_codes = %v, want [0]", worker.Retry.SuccessExitCodes)
+	}
+}
+
+func TestWorker_ValidateSchedule(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		worker  *Worker
+		wantErr bool
+	}{
+		{
+			name:   "no schedule",
+			worker: &Worker{Name: "manual", Command: "/bin/echo", Cwd: "/"},
+		},
+		{
+			name: "daily expression",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Cron: "0 3 * * *"},
+			},
+		},
+		{
+			name: "descriptor with a zone",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Cron: "@daily", Timezone: "America/Sao_Paulo"},
+			},
+		},
+		{
+			name: "broken expression",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Cron: "0 99 * * *"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unknown zone",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Cron: "@daily", Timezone: "Mars/Olympus"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "sibling keys without an expression are a typo, not a default",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Timezone: "UTC"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative jitter",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Schedule: Schedule{Cron: "@daily", Jitter: Duration(-1)},
+			},
+			wantErr: true,
+		},
+		{
+			name: "a required param leaves a firing with nobody to answer for it",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Params:   map[string]Param{"id": {Required: true}},
+				Schedule: Schedule{Cron: "@daily"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "an optional param with a default is fine",
+			worker: &Worker{
+				Name: "invoice", Command: "/bin/echo", Cwd: "/",
+				Params:   map[string]Param{"mode": {Default: "full"}},
+				Schedule: Schedule{Cron: "@daily"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			applyWorkerDefaults(tt.worker)
+
+			err := tt.worker.Validate()
+
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate() accepted an invalid schedule")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() returned %v", err)
+			}
+
+			if !tt.wantErr && tt.worker.Schedule.IsSet() && tt.worker.Schedule.Compiled() == nil {
+				t.Fatal("Validate() left the expression uncompiled")
+			}
+		})
+	}
+}
+
+// A service is already meant to be running at all times, so scheduling one is a
+// contradiction rather than a refinement.
+func TestWorker_ValidateSchedule_RejectsAService(t *testing.T) {
+	t.Parallel()
+
+	worker := &Worker{
+		Name: "api", Command: "/bin/echo", Cwd: "/", Type: core.TypeService,
+		Logs:     WorkerLogs{Rotate: LogRotate{MaxFiles: 3}},
+		Schedule: Schedule{Cron: "@daily"},
+	}
+
+	applyWorkerDefaults(worker)
+
+	if err := worker.Validate(); err == nil {
+		t.Fatal("Validate() accepted a scheduled service")
+	}
+}
+
+func TestNotify_validate(t *testing.T) {
+	t.Parallel()
+
+	webhook := func() *NotifyWebhook {
+		return &NotifyWebhook{URL: "https://hooks.example/incidents", Method: "POST", Timeout: Duration(5 * time.Second)}
+	}
+
+	tests := []struct {
+		name    string
+		notify  Notify
+		wantErr bool
+	}{
+		{name: "nothing configured"},
+		{
+			name:   "webhook",
+			notify: Notify{On: []NotifyEvent{NotifyOnFailed}, Webhook: webhook()},
+		},
+		{
+			name:   "exec",
+			notify: Notify{On: []NotifyEvent{NotifyOnCrashed}, Exec: &NotifyExec{Worker: "alert"}},
+		},
+		{
+			name:    "a delivery with no trigger is a typo",
+			notify:  Notify{Webhook: webhook()},
+			wantErr: true,
+		},
+		{
+			name:    "a trigger with nowhere to deliver",
+			notify:  Notify{On: []NotifyEvent{NotifyOnFailed}},
+			wantErr: true,
+		},
+		{
+			name:    "unknown event",
+			notify:  Notify{On: []NotifyEvent{"exploded"}, Webhook: webhook()},
+			wantErr: true,
+		},
+		{
+			name: "a webhook that is not http",
+			notify: Notify{
+				On:      []NotifyEvent{NotifyOnFailed},
+				Webhook: &NotifyWebhook{URL: "file:///etc/passwd", Timeout: Duration(time.Second)},
+			},
+			wantErr: true,
+		},
+		{
+			name: "a webhook with no host",
+			notify: Notify{
+				On:      []NotifyEvent{NotifyOnFailed},
+				Webhook: &NotifyWebhook{URL: "https:///incidents", Timeout: Duration(time.Second)},
+			},
+			wantErr: true,
+		},
+		{
+			name: "an unbounded webhook",
+			notify: Notify{
+				On:      []NotifyEvent{NotifyOnFailed},
+				Webhook: &NotifyWebhook{URL: "https://hooks.example/x"},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "an exec with no target",
+			notify:  Notify{On: []NotifyEvent{NotifyOnFailed}, Exec: &NotifyExec{}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := errors.Join(tt.notify.validate()...)
+
+			if tt.wantErr && err == nil {
+				t.Fatal("validate() accepted an invalid notify policy")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validate() returned %v", err)
+			}
+		})
+	}
+}
+
+// A notification target is resolved across every file, so it can only be
+// checked once the whole directory is in.
+func TestLoadWorkers_notifyTargets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		files   map[string]string
+		wantErr bool
+	}{
+		{
+			name: "target declared in another file",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: alert\n",
+				"b.yaml": "version: 1\nworkers:\n  - name: alert\n    command: /bin/echo\n",
+			},
+		},
+		{
+			name: "target does not exist",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: ghost\n",
+			},
+			wantErr: true,
+		},
+		{
+			name: "a notifier that notifies is a loop",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: alert\n  - name: alert\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: invoice\n",
+			},
+			wantErr: true,
+		},
+		{
+			name: "a service cannot be a notification",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: alert\n  - name: alert\n    type: service\n    command: /bin/echo\n    logs:\n      rotate:\n        max_files: 2\n",
+			},
+			wantErr: true,
+		},
+		{
+			name: "a required param a notification does not carry",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: alert\n  - name: alert\n    command: /bin/echo\n    args: [\"--to={{recipient}}\"]\n    params:\n      recipient: {required: true}\n",
+			},
+			wantErr: true,
+		},
+		{
+			name: "a required param the notification does carry",
+			files: map[string]string{
+				"a.yaml": "version: 1\nworkers:\n  - name: invoice\n    command: /bin/echo\n    notify:\n      on: [failed]\n      exec:\n        worker: alert\n  - name: alert\n    command: /bin/echo\n    args: [\"--worker={{worker}}\"]\n    params:\n      worker: {required: true}\n",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+
+			for name, body := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+					t.Fatalf("writing %s: %v", name, err)
+				}
+			}
+
+			_, err := LoadWorkers(dir)
+
+			if tt.wantErr && err == nil {
+				t.Fatal("LoadWorkers() accepted an unresolvable notification target")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("LoadWorkers() returned %v", err)
+			}
+		})
 	}
 }

@@ -1,0 +1,83 @@
+# Example scheduled worker. The daemon fires it on its own, so there is no
+# crontab entry holding an API token and no external caller to lose
+# (docs/SPEC.md §22.1).
+version: 1
+workers:
+  - name: nightly-report
+    enabled: true
+    type: task
+
+    command: /usr/bin/php
+    args:
+      - /var/www/app/artisan
+      - report:build
+      - "--range={{range}}"
+
+    # A firing carries no request, so every param has to answer for itself: a
+    # required param on a scheduled worker is refused at load time.
+    params:
+      range:
+        enum: [daily, weekly]
+        default: daily
+
+    cwd: /var/www/app
+    user: www-data
+    timeout: 30m
+
+    schedule:
+      # Five fields: minute hour day-of-month month day-of-week. The
+      # @-descriptors (@hourly, @daily, @weekly, @monthly, @yearly) also work.
+      cron: "15 3 * * *"
+
+      # Read in this zone, never the host zone: the same file has to describe
+      # the same instants on every node. Omitted means UTC.
+      timezone: America/Sao_Paulo
+
+      # What to do about occurrences that passed while the daemon was down.
+      # false records them and moves on, which is the default: surprise work
+      # after a restart is worse than work that did not happen. true runs the
+      # most recent missed occurrence once, never one per occurrence.
+      catch_up: false
+
+      # Spread the firing across a window, so a fleet sharing this schedule does
+      # not hit the same database at the same second.
+      jitter: 90s
+
+    # Overlap is decided by the lock, not by a separate knob: a scheduled worker
+    # with no lock of its own gets "schedule:<name>", and lock_conflict says what
+    # the next firing does when the previous one is still running.
+    #   queue  (default) — the firing waits its turn
+    #   reject           — the firing is refused and recorded as CANCELED
+    lock_conflict: reject
+
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff:
+        type: exponential
+        initial: 30s
+        max: 5m
+        jitter: 0.2
+
+    # Who to tell when it ends badly. Without this a failed task is silent until
+    # somebody opens the console (docs/SPEC.md §22.2).
+    notify:
+      # crashed = an attempt failed and another follows.
+      # failed / retries_exhausted / timeout = it is over.
+      # The events do not overlap: one outcome sends one notification.
+      on: [retries_exhausted, timeout]
+
+      webhook:
+        url: https://hooks.example.com/processd
+        timeout: 5s
+        retry: 2
+        headers:
+          X-Processd-Channel: incidents
+        # Off by default, and opt-in on purpose: logs carry secrets far more
+        # often than anyone intends.
+        include_log_tail: 0
+
+      # Runs a worker as well as, or instead of, the webhook. The outcome
+      # reaches it through declared params like any other execution.
+      exec:
+        worker: notify-slack

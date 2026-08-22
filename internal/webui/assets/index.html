@@ -20,6 +20,7 @@
       <button class="tab" data-view="overview" type="button">Overview</button>
       <button class="tab" data-view="processes" type="button">Processes</button>
       <button class="tab" data-view="workers" type="button">Workers</button>
+      <button class="tab" data-view="fleet" type="button" id="tab-fleet" hidden>Fleet</button>
     </nav>
 
     <form class="auth" id="auth-form" autocomplete="off">
@@ -102,6 +103,12 @@
         <label>Worker
           <input type="text" id="filter-worker" placeholder="all workers" spellcheck="false">
         </label>
+        <label id="filter-node-wrap" hidden>Node
+          <select id="filter-node">
+            <option value="">this node</option>
+            <option value="*">all nodes</option>
+          </select>
+        </label>
         <button type="submit">Apply</button>
         <label class="toggle">
           <input type="checkbox" id="auto-refresh" checked> auto refresh
@@ -111,7 +118,7 @@
       <div class="table-wrap">
         <table id="processes">
           <thead>
-            <tr><th>ID</th><th>Worker</th><th>Type</th><th>State</th><th>Attempt</th><th>Restarts</th><th>PID</th><th>Uptime</th><th>Created</th></tr>
+            <tr><th id="processes-node-head" hidden>Node</th><th>ID</th><th>Worker</th><th>Type</th><th>State</th><th>Attempt</th><th>Restarts</th><th>PID</th><th>Uptime</th><th>Created</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -124,11 +131,25 @@
       <div class="table-wrap">
         <table id="workers">
           <thead>
-            <tr><th>Name</th><th>Type</th><th>Enabled</th><th>Command</th><th>Max</th><th>Params</th><th></th></tr>
+            <tr><th>Name</th><th>Type</th><th>Enabled</th><th>Command</th><th>Max</th><th>Schedule</th><th>Params</th><th></th></tr>
           </thead>
           <tbody></tbody>
         </table>
       </div>
+    </section>
+    <section class="view" id="view-fleet" hidden>
+      <div class="table-wrap">
+        <table id="fleet">
+          <thead>
+            <tr><th>Node</th><th>Reachable</th><th>Version</th><th>Slots</th><th>Running</th><th>Queued</th><th>Last seen</th><th>URL</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">
+        A hub reads its nodes and never writes to one. An unreachable node keeps its last known
+        numbers, so a stale panel stays legible instead of going blank.
+      </p>
     </section>
   </main>
 

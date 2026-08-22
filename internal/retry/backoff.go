@@ -65,17 +65,7 @@ func applyJitter(delay time.Duration, jitter float64) time.Duration {
 
 // Attempts returns how many attempts a worker is allowed to make in total, or
 // config.AttemptsUnlimited when the policy sets no ceiling.
-func Attempts(r config.Retry) int {
-	if !r.IsEnabled() {
-		return 1
-	}
-
-	if r.MaxAttempts.Unlimited() {
-		return config.AttemptsUnlimited
-	}
-
-	return max(r.MaxAttempts.Int(), 1)
-}
+func Attempts(r config.Retry) int { return r.EffectiveAttempts() }
 
 // Allowed reports whether another attempt may run after a failure of the given
 // class, taking the attempt counter into account.

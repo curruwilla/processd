@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,8 @@ import (
 
 // processRow is the subset of the process representation the CLI prints.
 type processRow struct {
+	// Node is empty unless the row came from a fleet listing.
+	Node     string `json:"node"`
 	ID       string `json:"id"`
 	Worker   string `json:"worker"`
 	Type     string `json:"type"`
@@ -42,6 +45,13 @@ func newPsCommand() *cobra.Command {
 				values.Set("type", kind)
 			}
 
+			// On a hub, naming a node reads that node instead of this one. "*"
+			// merges every node into one page.
+			node := mustString(cmd, "node")
+			if node != "" {
+				values.Set("node", node)
+			}
+
 			values.Set("limit", strconv.Itoa(mustInt(cmd, "limit")))
 
 			if cursor := mustString(cmd, "cursor"); cursor != "" {
@@ -49,8 +59,9 @@ func newPsCommand() *cobra.Command {
 			}
 
 			var page struct {
-				Items      []processRow `json:"items"`
-				NextCursor string       `json:"next_cursor"`
+				Items       []processRow `json:"items"`
+				NextCursor  string       `json:"next_cursor"`
+				Unreachable []string     `json:"unreachable"`
 			}
 
 			if err := newClient().do(cmd.Context(), "GET", query("/v1/processes", values), nil, &page); err != nil {
@@ -61,7 +72,13 @@ func newPsCommand() *cobra.Command {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(page)
 			}
 
-			printProcessTable(cmd, page.Items)
+			printProcessTable(cmd, page.Items, node != "")
+
+			// A degraded page has to say so: rows that are missing because a
+			// node did not answer look exactly like rows that do not exist.
+			if len(page.Unreachable) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "unreachable nodes: %s\n", strings.Join(page.Unreachable, ", "))
+			}
 
 			if page.NextCursor != "" {
 				fmt.Fprintf(cmd.ErrOrStderr(), "more results: --cursor %s\n", page.NextCursor)
@@ -77,17 +94,29 @@ func newPsCommand() *cobra.Command {
 	cmd.Flags().Int("limit", 50, "maximum number of rows")
 	cmd.Flags().String("cursor", "", "continue a previous listing")
 	cmd.Flags().String("output", "table", "output format: table or json")
+	cmd.Flags().String("node", "", `read a fleet node instead of this one, or "*" to merge them all`)
 
 	return cmd
 }
 
-func printProcessTable(cmd *cobra.Command, rows []processRow) {
+// printProcessTable renders the listing. The node column appears only for a
+// fleet listing, where an ID on its own cannot be looked up again.
+func printProcessTable(cmd *cobra.Command, rows []processRow, withNode bool) {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "ID\tWORKER\tTYPE\tSTATUS\tPID\tATTEMPT\tRESTARTS\tEXIT")
+	header := "ID\tWORKER\tTYPE\tSTATUS\tPID\tATTEMPT\tRESTARTS\tEXIT"
+	if withNode {
+		header = "NODE\t" + header
+	}
+
+	fmt.Fprintln(w, header)
 
 	for _, row := range rows {
+		if withNode {
+			fmt.Fprintf(w, "%s\t", orDash(row.Node))
+		}
+
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
 			row.ID,
 			row.Worker,

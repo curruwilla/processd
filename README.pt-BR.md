@@ -21,6 +21,11 @@ processos de verdade — mas ainda não foi usado em produção. Trate a primeir
 * Captura stdout e stderr por tentativa, junto do exit code e do sinal de término, e transmite a
   saída ao vivo.
 * Aplica timeout, retry com backoff e locks contra execução concorrente.
+* Dispara um worker pelo cron dele mesmo, mostra a próxima execução e registra as ocorrências que
+  perdeu enquanto esteve fora do ar.
+* Avisa alguém quando uma execução termina mal, por webhook ou executando outro worker.
+* Lê outros nodes — um console, um `ps`, stream de log por proxy — e executa no node que você nomear,
+  sem nunca escolher esse node por você.
 * Persiste o estado em SQLite e reconcilia o que encontra depois de um restart.
 * Expõe métricas Prometheus, CPU e memória por execução, e um console web embutido.
 * Encerra o daemon e toda a árvore de processos de forma graciosa.
@@ -478,10 +483,17 @@ ausente entrega.
 | `history.max_rows` | int | `500000` | teto de linhas retidas |
 | `logs.max_bytes_per_stream` | tamanho > 0 | `32MiB` | cap por stream por tentativa; ao atingir, marca `log_truncated` |
 | `logs.retention` | duração | `14d` | GC dos arquivos de log |
+| `notify` | objeto | nenhum | a política de notificação padrão, no mesmo formato que um worker usa. Um worker que declara a sua substitui esta |
+| `fleet.nodes[].name` | string | obrigatório | único; é como o node aparece em toda resposta de fleet |
+| `fleet.nodes[].url` | URL | obrigatório | `http` ou `https`, com host |
+| `fleet.nodes[].token_file` | caminho | obrigatório | caminho absoluto de um token **read-only** daquele node. Não existe token inline de propósito: este arquivo guarda digests, nunca segredos |
+| `fleet.poll_interval` | duração > 0 | `10s` | de quanto em quanto tempo cada node é consultado |
+| `fleet.timeout` | duração > 0 | `5s` | limita uma chamada a um node |
 | `ui.enabled` | bool | `true` | console web em `/ui/` |
 | `auth.tokens[].name` | string | — obrigatório | identifica o token na trilha de auditoria |
 | `auth.tokens[].hash` | string | — obrigatório | `sha256:...`, de `processd setup` ou `processd token hash` |
 | `auth.tokens[].workers` | lista | `[]` = todos | restringe o token a workers específicos |
+| `auth.tokens[].read_only` | bool | `false` | recusa toda chamada que muda estado com este token. É o que um hub usa para ler um node, e o que um dashboard deveria receber |
 
 ## Definição de workers
 
@@ -533,6 +545,8 @@ workers:
 | `lock_conflict` | enum | `queue` | `queue` espera o lock liberar; `reject` responde `409` na hora |
 | `overridable` | lista de enum | `[]` | o que um request pode sobrescrever: `env`, `timeout`, `lock`. Qualquer outro → `400` |
 | `retry` | objeto | desligado | tabela abaixo |
+| `schedule` | objeto | nenhum | dispara o worker sozinho; tabela abaixo. Recusado num `service` — um service já deveria estar rodando o tempo todo |
+| `notify` | objeto | o `notify` do daemon, se houver | quem avisar quando uma execução termina mal; tabela abaixo |
 | `logs.max_bytes_per_stream` | tamanho | o valor do daemon (`32MiB`) | cap por stream por tentativa; a retenção é do daemon |
 | `logs.rotate.max_files` | int ≥ 0 | `0` = sem rotação | quantos arquivos rotacionados manter atrás do vivo. Sem rotação o stream para de gravar ao encher o cap — **obrigatório em um `service`** |
 
@@ -582,6 +596,147 @@ Curvas: `fixed` = `initial`; `linear` = `initial × tentativa`; `exponential` =
 O lock é mantido entre tentativas: soltá-lo durante o backoff deixaria outra execução tomá-lo no
 meio do retry.
 
+### `schedule`
+
+Um worker agendado é disparado pelo daemon que o executa. Não existe entrada de `crontab` guardando
+um token da API, nem um chamador externo cuja ausência ninguém percebe.
+
+```yaml
+- name: nightly-report
+  command: /usr/bin/php
+  args: [/var/www/app/artisan, report:build, "--range={{range}}"]
+  params:
+    range: { enum: [daily, weekly], default: daily }
+  lock_conflict: reject           # pula um disparo enquanto o anterior ainda roda
+  schedule:
+    cron: "15 3 * * *"
+    timezone: America/Sao_Paulo
+    catch_up: false
+    jitter: 90s
+```
+
+| Chave | Tipo | Padrão | Valores e regras |
+|---|---|---|---|
+| `cron` | string | — obrigatória | cinco campos, `minuto hora dia-do-mês mês dia-da-semana`, ou um de `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. Sem ela, as outras chaves são um erro de digitação e **falham o load** |
+| `timezone` | zona IANA | `UTC` | nunca a zona do host: o mesmo arquivo tem que descrever os mesmos instantes em todo node |
+| `catch_up` | bool | `false` | `false` registra as ocorrências perdidas enquanto o daemon esteve fora e segue em frente. `true` executa a **mais recente** delas uma vez — nunca uma por ocorrência |
+| `jitter` | duração | `0` | espalha o disparo aleatoriamente em `[0, jitter]`, para que vários nodes com o mesmo horário não batam na mesma dependência no mesmo segundo |
+
+Sintaxe da expressão: `*`, `5`, `1-5`, `*/15`, `1-5/2`, `5/20` (de 20 em 20 a partir do 5) e listas
+separadas por vírgula de qualquer um deles. Mês e dia da semana aceitam nomes de três letras (`jan`,
+`fri`); domingo é `0` e `7`. Quando **os dois** campos de dia estão restritos eles se combinam com OU,
+não E — a regra do Vixie cron, então `0 0 20 * fri` significa "dia 20, e toda sexta".
+
+Regras que falham o load, não o disparo:
+
+* Todo param precisa se resolver sem request. Um param `required: true` num worker agendado é
+  recusado — um disparo não manda params, então dê um `default` a ele ou tire a obrigatoriedade.
+* Um `service` não pode ser agendado.
+* Uma expressão quebrada ou uma zona desconhecida falham o reload que as introduziu, não o tick das
+  03:00 que ninguém está olhando.
+
+Sobreposição não é um botão separado. Um worker agendado sem `lock` próprio ganha `schedule:<nome>`, e
+`lock_conflict` decide o que o próximo disparo faz enquanto o anterior ainda roda: `queue` espera a
+vez, `reject` recusa e registra uma execução `CANCELED` com `reason: lock_conflict`. Nos dois casos o
+disparo está no histórico.
+
+**Horário de verão** é aritmética, não caso especial, e as duas direções diferem de propósito:
+
+* *Adiantando* — o relógio de parede nunca mostra a hora pulada, então um agendamento dentro dela não
+  dispara naquele dia. É pulado, não movido.
+* *Atrasando* — a hora repetida entregaria o mesmo horário local a dois instantes, então o segundo é
+  pulado. `03:00 diário` significa um disparo naquele dia.
+
+O que um disparo carrega: a execução é criada a partir da definição atual do worker, sem params além
+dos defaults, e o `metadata` dela registra `processd.trigger: schedule` e `processd.occurrence`, o
+instante agendado a que ela pertence. Esse instante não é a hora de criação — jitter e atraso de
+despacho movem o segundo, nunca a grade.
+
+`processd workers` e `GET /v1/workers` mostram `next_run`, `last_fired_at` e `missed_runs`. Um
+agendamento cuja próxima execução ninguém enxerga é a entrada de crontab que ele substituiu.
+
+### `notify`
+
+Uma execução que falha é silenciosa, a não ser que alguém esteja olhando o console ou já exista uma
+regra no Prometheus. É o buraco que todo wrapper script foi escrito para tapar.
+
+```yaml
+- name: nightly-report
+  command: /usr/bin/php
+  notify:
+    on: [retries_exhausted, timeout]
+    webhook:
+      url: https://hooks.example.com/processd
+      timeout: 5s
+      retry: 2
+      headers: { X-Processd-Channel: incidents }
+    exec:
+      worker: notify-slack
+```
+
+Um worker sem `notify` próprio usa o do daemon, no `processd.yaml`, que tem o mesmo formato. Um
+worker que declara o seu **substitui** aquele por inteiro, sem mesclar — duas meias-políticas
+decidindo uma entrega é mais difícil de ler que qualquer uma das duas.
+
+| Chave | Tipo | Padrão | Valores e regras |
+|---|---|---|---|
+| `on` | lista de enum | obrigatória se qualquer outra chave estiver presente | `failed`, `crashed`, `retries_exhausted`, `timeout` |
+| `webhook.url` | URL | — | `http` ou `https`, com host. Qualquer outra coisa falha o load |
+| `webhook.method` | string | `POST` | |
+| `webhook.headers` | mapa | `{}` | enviados como escritos; `Content-Type: application/json` é sempre definido |
+| `webhook.timeout` | duração | `5s` | limita uma tentativa. Precisa ser maior que zero |
+| `webhook.retry` | int ≥ 0 | `0` | tentativas extras depois de uma falha, com 2s entre elas |
+| `webhook.include_log_tail` | int ≥ 0 | `0` = nenhuma | últimas N linhas da saída da tentativa. **Desligado por padrão e opt-in de propósito** — log carrega segredo muito mais vezes do que alguém pretende |
+| `exec.worker` | nome de worker | — | executa aquele worker; veja abaixo |
+
+**Os eventos não se sobrepõem.** Um desfecho manda exatamente uma notificação, e o daemon escolhe qual:
+
+| Evento | Significa |
+|---|---|
+| `crashed` | uma tentativa terminou mal e **outra vem em seguida** |
+| `timeout` | acabou, e a última tentativa foi morta pelo próprio prazo |
+| `retries_exhausted` | acabou, e uma política de retry gastou o orçamento dela |
+| `failed` | acabou, sem política de retry para gastar — incluindo `no_retry_exit_codes` |
+
+Nada é enviado para um sucesso, para `DELETE /v1/processes/{id}` nem para um shutdown: quem parou uma
+execução já sabe.
+
+`exec.worker` executa um worker em vez do webhook, ou junto dele. Ele obedece a mesma regra de
+qualquer outra execução — **nada chega a um processo que o worker não declarou**. O desfecho é
+oferecido como params, e só os que o alvo declara são passados:
+
+```
+event  process_id  worker  state  reason  attempt  exit_code  signal  node
+```
+
+Regras que falham o load, e não a falha que deveriam reportar: o alvo precisa existir (em qualquer
+arquivo), precisa ser `task`, não pode declarar `notify` próprio — um notificador que notifica sobre
+a própria falha é um laço sem limite — e não pode exigir (`required`) um param fora dessa lista.
+
+**O que o payload carrega**, e deliberadamente não carrega: identidade, desfecho, tempos e o
+`metadata` que o próprio cliente colocou lá. Não há ambiente, nem comando, nem lista de argumentos. O
+ambiente do daemon guarda segredos por construção, e um webhook é o único lugar por onde eles sairiam
+do node.
+
+```json
+{
+  "event": "retries_exhausted",
+  "node": "app-01",
+  "sent_at": "2026-08-22T00:30:58Z",
+  "process": {
+    "id": "proc_01M0KE1F77NPXZAG15REPZVJC7", "worker": "nightly-report", "type": "task",
+    "state": "FAILED", "reason": "max_attempts", "attempt": 3, "restarts": 0,
+    "exit_code": 7, "metadata": {"invoice": "42"},
+    "created_at": "...", "started_at": "...", "finished_at": "...", "duration_ms": 812
+  }
+}
+```
+
+A entrega é **best effort, e nunca encosta na execução que ela descreve**. Uma notificação que não
+consegue ser entregue é logada e descartada; ela nunca falha, atrasa ou repete o trabalho. A fila é
+limitada, então um node cujos workers estão todos falhando não acumula uma pilha de notificações em
+cima do incidente, e o shutdown espera no máximo 5s pelo que estiver na fila.
+
 ## Ciclo de vida
 
 ```
@@ -615,13 +770,14 @@ lado da configuração. Toda flag persistente tem a variável com prefixo `PROCE
 | `processd setup [--dry-run] [--rotate-token] [--listen addr] [--systemd=false] [--start=false] [--output json]` | instala o node: diretórios, configuração, token, unit systemd, e imprime tudo |
 | `processd serve --config <path>` | sobe o daemon |
 | `processd status` | saúde, versão, slots, rodando e na fila |
-| `processd ps [--status S] [--type task\|service] [--worker w] [--limit n] [--cursor c] [--output table\|json]` | lista execuções |
-| `processd run <worker> [--param nome=valor] [--lock k]` | cria uma execução |
-| `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f]` | saída capturada, com `-f` em streaming |
-| `processd stop <id> [--grace 15s]` | `SIGTERM` no grupo, `SIGKILL` depois da graça |
-| `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m]` | para a execução e cria outra a partir da definição atual do worker |
-| `processd signal <id> <SINAL>` | envia um sinal do allowlist ao grupo |
-| `processd workers` | workers carregados, com os params declarados |
+| `processd ps [--status S] [--type task\|service] [--worker w] [--node n\|*] [--limit n] [--cursor c] [--output table\|json]` | lista execuções; `--node` lê um node da fleet em vez deste |
+| `processd run <worker> [--param nome=valor] [--lock k] [--node n]` | cria uma execução; `--node` executa naquele node da fleet |
+| `processd logs <id> [--stream stdout\|stderr\|both] [--attempt n] [--tail n] [-f] [--node n]` | saída capturada, com `-f` em streaming |
+| `processd stop <id> [--grace 15s] [--node n]` | `SIGTERM` no grupo, `SIGKILL` depois da graça |
+| `processd restart <id> [--grace 15s] [--param n=v] [--wait 1m] [--node n]` | para a execução e cria outra a partir da definição atual do worker |
+| `processd signal <id> <SINAL> [--node n]` | envia um sinal do allowlist ao grupo |
+| `processd workers` | workers carregados, com os params declarados, a expressão cron e a próxima execução |
+| `processd fleet [--output table\|json]` | num hub: cada node que ele lê, com o motivo de qualquer um inalcançável |
 | `processd reload` | relê `workers.d` |
 | `processd token hash` | lê um token de stdin e imprime o digest da configuração |
 
@@ -636,14 +792,14 @@ Base `/v1`, JSON na entrada e na saída. Todo endpoint exige `Authorization: Bea
 
 | Endpoint | Notas |
 |---|---|
-| `POST /v1/processes` | `{"worker":"...","params":{...}}`. `201` admitida, `202` enfileirada. Um `Idempotency-Key` opcional devolve a resposta original com `Idempotent-Replay: true` enquanto aquela execução estiver retida; a mesma chave com corpo diferente → `409` |
+| `POST /v1/processes` | `{"worker":"...","params":{...}}`. `201` admitida, `202` enfileirada. Um `Idempotency-Key` opcional devolve a resposta original com `Idempotent-Replay: true` enquanto aquela execução estiver retida; a mesma chave com corpo diferente → `409`. Num hub, um `node` opcional despacha para lá |
 | `GET /v1/processes` | filtros: `status` (repetível), `type`, `worker`, `lock`, `created_after`, `created_before`; `limit` default 50, máximo 500; paginação por cursor |
 | `GET /v1/processes/{id}` | representação completa, com CPU e memória ao vivo enquanto roda |
 | `DELETE /v1/processes/{id}?grace=15s` | `CANCELED` com `reason: user_request`, e **nunca** dispara retry |
 | `POST /v1/processes/{id}/signal` | `{"signal":"SIGUSR1"}` |
 | `GET /v1/processes/{id}/logs` | `?stream=stdout\|stderr\|both&attempt=N&tail=N` |
 | `GET /v1/processes/{id}/logs/stream` | Server-Sent Events, um evento `line` por linha, `end` quando a tentativa termina |
-| `GET /v1/workers` | os workers que o token pode ver |
+| `GET /v1/workers` | os workers que o token pode ver; um agendado traz `schedule` com `cron`, `timezone`, `next_run`, `last_fired_at`, `last_missed_at` e `missed_runs` |
 | `POST /v1/reload` | relê `workers.d`, tudo-ou-nada |
 | `GET /v1/health[?deep=1]` | público; `deep` também pinga o store |
 | `GET /v1/stats` | slots, profundidade da fila, estados, contadores de service |
@@ -655,12 +811,113 @@ Os erros sempre têm a mesma cara:
 | Status | Quando |
 |---|---|
 | `400` | payload inválido, param inválido ou não declarado, `type` não suportado, sinal fora do allowlist |
-| `401` / `403` | sem token válido / token sem permissão para aquele worker, ou comando livre em modo `workers` |
+| `401` / `403` | sem token válido / token sem permissão para aquele worker, token read-only numa chamada que muda estado, ou comando livre em modo `workers` |
 | `404` | worker ou execução inexistente |
 | `409` | lock ocupado com `lock_conflict: reject`, sinal em execução que não está rodando, chave de idempotência reusada com corpo diferente |
 | `422` | worker desabilitado |
 | `429` | fila cheia (`queue.max_depth`) |
 | `503` | daemon encerrando, ou service sem slot livre (`no_capacity`) |
+| `504` | um hub despachou para um node que não respondeu (`dispatch_unknown`). **Não é falha** — a execução pode estar rodando; repita com o mesmo `Idempotency-Key` |
+
+## Fleet
+
+Um **hub** é um processd comum que também lê outros nodes. Ele agrega a API de leitura deles e faz
+proxy das leituras, e **nunca escreve em nenhum**.
+
+```yaml
+# /etc/processd/processd.yaml, só no hub
+fleet:
+  poll_interval: 10s
+  nodes:
+    - name: app-01
+      url: https://10.0.0.11:7373
+      token_file: /etc/processd/nodes/app-01.token
+    - name: app-02
+      url: https://10.0.0.12:7373
+      token_file: /etc/processd/nodes/app-02.token
+```
+
+```bash
+processd fleet                    # cada node: alcançável, versão, slots, rodando, na fila, visto por último
+processd ps --node app-01         # as execuções daquele node, com a paginação dele
+processd ps --node '*'            # as mais recentes de todos os nodes, mescladas
+```
+
+O console ganha uma aba **Fleet** e um seletor de node na visão de processos, e os dois ficam
+escondidos num daemon que não agrega nada.
+
+**Nada é configurado no node.** O hub faz poll; não há protocolo de registro nem estado do hub no
+node, então um node não sabe que está sendo lido e não precisa de mudança nenhuma para entrar numa
+fleet. Essa simplificação só existe porque a agregação nunca escreve.
+
+| Endpoint | Notas |
+|---|---|
+| `GET /v1/fleet/nodes` | o último poll de cada node: `reachable`, `version`, `last_seen`, `stats`, e `error` quando ele não responde |
+| `GET /v1/fleet/nodes/{node}/{path...}` | faz proxy de qualquer leitura para o `/v1/{path}` daquele node, incluindo `logs/stream`. Transmite conforme chega; um caminho que sobe para fora de `/v1` é recusado |
+| `GET /v1/processes?node=app-01` | a listagem daquele node, com o cursor dele |
+| `GET /v1/processes?node=*` | as mais recentes de todos os nodes, cada linha marcada com `node` |
+| `POST /v1/processes` com `"node"` | despacha para aquele node; a resposta é a do próprio node, mais `X-Processd-Node`. `504 dispatch_unknown` quando o node não responde |
+| `POST`/`DELETE /v1/fleet/nodes/{node}/{path...}` | encaminha uma escrita para o node que o cliente nomeou. O node aplica as regras dele ao token do hub, então um `read_only` recusa |
+
+Num daemon sem `fleet`, essas rotas **não existem** — a ausência é a afirmação de que não há fleet, em
+vez de uma lista vazia que parece uma quebrada.
+
+O que vale saber antes de depender disso:
+
+* **Hub fora do ar não muda nada.** Todos os nodes continuam executando, supervisionando e repetindo
+  exatamente como estavam. O pior caso é um painel desatualizado.
+* **O token é o do hub, nunca o de quem chamou.** Um cliente se autentica no hub; o hub se autentica
+  em cada node com o token do `token_file`, que ele relê a cada poll — então rotacionar o token de um
+  node passa a valer dentro de um intervalo, e não no próximo restart. Dê ao hub um token
+  `read_only: true`, e o node recusa uma escrita mesmo que o hub um dia seja levado a tentar uma.
+* **Um node inalcançável degrada a resposta, nunca a derruba.** Uma listagem mesclada devolve o que os
+  nodes vivos tinham e nomeia os que não responderam em `unreachable`; o status de um node mantém os
+  últimos números conhecidos ao lado do motivo de agora estar inalcançável.
+* **Uma página mesclada não tem cursor.** Não existe ordenação entre nodes para paginar, e inventar
+  uma seria um índice distribuído que ninguém pediu. Para ir mais fundo, nomeie um node.
+* **Diferença de versão é regra, não exceção.** As respostas dos nodes são decodificadas de forma
+  tolerante, então um contador ou campo de um node mais novo passa adiante em vez de ser descartado.
+* **Log é proxy, nunca cópia.** A saída fica no node que a produziu.
+
+### Executando num node
+
+Todo comando que age sobre uma execução aceita `--node`, e o hub encaminha para o node nomeado. **O
+cliente escolhe o node; o hub nunca escolhe.**
+
+```bash
+processd run sleeper --node app-01
+processd logs <id> --node app-01 -f
+processd signal <id> SIGUSR1 --node app-01
+processd stop <id> --node app-01
+processd restart <id> --node app-01
+```
+
+Pela API, isso é `POST /v1/processes` com um campo `node`, ou qualquer método contra
+`/v1/fleet/nodes/{node}/{path...}`. O campo `node` é removido antes de o corpo chegar ao node, que não
+faz ideia do que seja uma fleet.
+
+Três coisas fazem disso um roteador e não um scheduler:
+
+* **A execução mora só no node.** O hub não guarda cópia do que encaminhou, então o `processd ps` dele
+  continua vazio. Não há nada para reconciliar, e portanto nada para reconciliar errado.
+* **`node` nunca é inferido.** Sem ele a execução é local e explícita; o hub não "escolhe um".
+* **Silêncio não é falha.** Um node que não respondeu não disse não — a execução pode estar rodando
+  neste momento. O hub responde `504` com `dispatch_unknown` e diz para repetir com o mesmo
+  `Idempotency-Key`, e nunca marca nada como falho nem reagenda em lugar nenhum.
+
+**Se um hub pode escrever é decisão sua, e você a toma com um token.** Instale um token
+`read_only: true` para um node e aquele node recusa toda escrita vinda do hub, faça o hub o que fizer:
+
+```console
+$ processd run sleeper --node app-02
+error: read_only_token: token "hub" is read-only and may not POST
+```
+
+O `Idempotency-Key` é o do cliente, encaminhado como veio, e não um que o hub invente: o hub responde
+`dispatch_unknown` e para, então quem repete é o cliente, e a chave precisa ser estável entre as
+tentativas dele.
+
+**Scheduling distribuído não faz parte disso e não vem depois** — veja o roadmap.
 
 ## Métricas
 
@@ -712,13 +969,14 @@ nada roda como root sem opt-in explícito.
 | 2 ✅ | supervisor: fila, locks, retry/backoff, timeout, recovery | — |
 | 3 ✅ | observabilidade: métricas, streaming de logs, CPU/memória, console web | — |
 | 4 ✅ | `type: service`: restart contínuo e rotação de log | — |
-| 5 | trigger agendado: `schedule` no worker, próxima execução visível, política de sobreposição | — |
-| 6 | notificação de falha: webhook ou chamada de worker em falha, crash ou retry esgotado | — |
-| 7 | fleet view: agregação read-only de vários nodes, um console, stream de log por proxy | — |
-| 8 | dispatch remoto explícito: executar no node que o cliente nomear | 7 |
+| 5 ✅ | trigger agendado: `schedule` no worker, próxima execução visível, política de sobreposição | — |
+| 6 ✅ | notificação de falha: webhook ou chamada de worker em falha, crash ou retry esgotado | — |
+| 7 ✅ | fleet view: agregação read-only de vários nodes, um console, stream de log por proxy | — |
+| 8 ✅ | dispatch remoto explícito: executar no node que o cliente nomear | 7 |
 
-As fases 5 e 6 são locais e independentes entre si, então podem sair em qualquer ordem. A fase 7 lê
-os outros nodes e nunca escreve neles: um hub fora do ar deixa todos os nodes rodando.
+As fases 5 e 6 são locais: não precisam de uma segunda máquina e não mudam nada em como um node é
+endereçado. A fase 7 só lê, então um hub fora do ar deixa todos os nodes rodando exatamente como
+estavam, e a fase 8 escreve apenas no node que um cliente nomeou.
 
 **Scheduling distribuído é não-objetivo, não uma fase futura.** Placement automático, least-loaded,
 constraints, réplicas, failover entre nodes e locks distribuídos ficam ao lado do Raft em

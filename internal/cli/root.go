@@ -75,6 +75,7 @@ func newRootCommand() *cobra.Command {
 		newSignalCommand(),
 		newLogsCommand(),
 		newWorkersCommand(),
+		newFleetCommand(),
 		newReloadCommand(),
 		newTokenCommand(),
 	)

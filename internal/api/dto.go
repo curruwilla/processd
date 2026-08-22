@@ -9,6 +9,9 @@ import (
 
 // createProcessRequest is the body of POST /v1/processes.
 type createProcessRequest struct {
+	// Node dispatches the execution to a fleet node instead of this one. The
+	// client names it; the hub never chooses (docs/SPEC.md §6.11).
+	Node     string            `json:"node"`
 	Worker   string            `json:"worker"`
 	Type     core.Type         `json:"type"`
 	Params   map[string]string `json:"params"`
@@ -101,6 +104,21 @@ type workerResponse struct {
 	Command      string            `json:"command"`
 	Params       map[string]string `json:"params"`
 	MaxProcesses int               `json:"max_processes"`
+	Schedule     *scheduleResponse `json:"schedule,omitempty"`
+}
+
+// scheduleResponse describes when a worker fires on its own.
+//
+// NextRun is the point of the endpoint: a schedule nobody can see the next
+// firing of is exactly the crontab entry this replaced. MissedRuns is the other
+// half — an occurrence that did not run is a fact, not an absence.
+type scheduleResponse struct {
+	Cron         string     `json:"cron"`
+	Timezone     string     `json:"timezone"`
+	NextRun      *time.Time `json:"next_run"`
+	LastFiredAt  *time.Time `json:"last_fired_at,omitempty"`
+	LastMissedAt *time.Time `json:"last_missed_at,omitempty"`
+	MissedRuns   int        `json:"missed_runs"`
 }
 
 // healthResponse is the body of GET /v1/health. Store is only filled in by a

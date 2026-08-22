@@ -20,6 +20,7 @@ const restartPoll = 250 * time.Millisecond
 // restartOptions carries what a restart needs beyond the execution id.
 type restartOptions struct {
 	id     string
+	node   string
 	grace  string
 	params map[string]string
 	wait   time.Duration
@@ -60,6 +61,7 @@ func newRestartCommand() *cobra.Command {
 
 			return restartExecution(cmd.Context(), newClient(), cmd.OutOrStdout(), restartOptions{
 				id:     args[0],
+				node:   mustString(cmd, "node"),
 				grace:  mustString(cmd, "grace"),
 				params: params,
 				wait:   mustDuration(cmd, "wait"),
@@ -70,6 +72,7 @@ func newRestartCommand() *cobra.Command {
 	cmd.Flags().String("grace", "", "how long to wait before SIGKILL, e.g. 15s")
 	cmd.Flags().StringSlice("param", nil, "worker parameter as name=value, repeatable")
 	cmd.Flags().Duration("wait", time.Minute, "how long to wait for the execution to stop and for its slot")
+	cmd.Flags().String("node", "", "act on this fleet node instead of the one being addressed")
 
 	return cmd
 }
@@ -80,7 +83,7 @@ func newRestartCommand() *cobra.Command {
 // removed from workers.d, or disabled there, would otherwise leave the node
 // with the execution stopped and nothing left to bring it back.
 func restartExecution(ctx context.Context, c *client, out io.Writer, opts restartOptions) error {
-	current, err := getProcess(ctx, c, opts.id)
+	current, err := getProcess(ctx, c, opts.node, opts.id)
 	if err != nil {
 		return err
 	}
@@ -89,7 +92,7 @@ func restartExecution(ctx context.Context, c *client, out io.Writer, opts restar
 		return fmt.Errorf("%w: %s ran a raw command, so there is no worker to restart it from", errUsage, opts.id)
 	}
 
-	if err := checkWorker(ctx, c, current.Worker); err != nil {
+	if err := checkWorker(ctx, c, opts.node, current.Worker); err != nil {
 		return err
 	}
 
@@ -103,7 +106,7 @@ func restartExecution(ctx context.Context, c *client, out io.Writer, opts restar
 			return err
 		}
 
-		if err := awaitSettled(ctx, c, opts.id, deadline); err != nil {
+		if err := awaitSettled(ctx, c, opts.node, opts.id, deadline); err != nil {
 			return err
 		}
 
@@ -121,10 +124,10 @@ func restartExecution(ctx context.Context, c *client, out io.Writer, opts restar
 }
 
 // getProcess reads the current representation of an execution.
-func getProcess(ctx context.Context, c *client, id string) (processSummary, error) {
+func getProcess(ctx context.Context, c *client, node, id string) (processSummary, error) {
 	var current processSummary
 
-	if err := c.do(ctx, "GET", "/v1/processes/"+url.PathEscape(id), nil, &current); err != nil {
+	if err := c.do(ctx, "GET", nodePath(node, "/v1/processes/"+url.PathEscape(id)), nil, &current); err != nil {
 		return processSummary{}, err
 	}
 
@@ -133,13 +136,13 @@ func getProcess(ctx context.Context, c *client, id string) (processSummary, erro
 
 // checkWorker refuses the restart when the daemon could not create the
 // replacement afterwards.
-func checkWorker(ctx context.Context, c *client, name string) error {
+func checkWorker(ctx context.Context, c *client, node, name string) error {
 	var workers []struct {
 		Name    string `json:"name"`
 		Enabled bool   `json:"enabled"`
 	}
 
-	if err := c.do(ctx, "GET", "/v1/workers", nil, &workers); err != nil {
+	if err := c.do(ctx, "GET", nodePath(node, "/v1/workers"), nil, &workers); err != nil {
 		return err
 	}
 
@@ -167,7 +170,7 @@ func stopForRestart(ctx context.Context, c *client, opts restartOptions) error {
 		values.Set("grace", opts.grace)
 	}
 
-	path := query("/v1/processes/"+url.PathEscape(opts.id), values)
+	path := nodePath(opts.node, query("/v1/processes/"+url.PathEscape(opts.id), values))
 
 	if err := c.do(ctx, "DELETE", path, nil, nil); err != nil && !hasCode(err, "not_running") {
 		return err
@@ -180,9 +183,9 @@ func stopForRestart(ctx context.Context, c *client, opts restartOptions) error {
 // replacement earlier would race the stop: a service takes its slot at
 // admission or is refused outright, and the old slot is only free once the
 // execution it belonged to has settled.
-func awaitSettled(ctx context.Context, c *client, id string, deadline time.Time) error {
+func awaitSettled(ctx context.Context, c *client, node, id string, deadline time.Time) error {
 	for {
-		current, err := getProcess(ctx, c, id)
+		current, err := getProcess(ctx, c, node, id)
 		if err != nil {
 			return err
 		}
@@ -235,7 +238,9 @@ func createReplacement(
 	for {
 		var created createdProcess
 
-		err := c.do(ctx, "POST", "/v1/processes", request, &created)
+		// The replacement is dispatched the same way the original was reached:
+		// naming the node, never letting the hub choose one.
+		err := c.do(ctx, "POST", nodePath(opts.node, "/v1/processes"), request, &created)
 		if err == nil {
 			return created, nil
 		}

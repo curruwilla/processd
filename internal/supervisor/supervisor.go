@@ -63,14 +63,30 @@ func (nopMetrics) AttemptStarted(string)                         {}
 func (nopMetrics) AttemptFinished(string, string, time.Duration) {}
 func (nopMetrics) ServiceRestarted(string)                       {}
 
+// Notifier reports a settled outcome to whoever the worker asked for. The
+// supervisor is the only component that sees an attempt through to its meaning,
+// so the report is raised from here.
+//
+// It must not block and must not fail: the outcome it describes has already
+// happened and is already recorded.
+type Notifier interface {
+	Notify(event config.NotifyEvent, p *core.Process, worker *config.Worker)
+}
+
+// nopNotifier is the default: the supervisor runs the same with or without one.
+type nopNotifier struct{}
+
+func (nopNotifier) Notify(config.NotifyEvent, *core.Process, *config.Worker) {}
+
 // Supervisor owns the lifecycle of running executions.
 type Supervisor struct {
-	cfg     config.Config
-	store   store.Store
-	runner  runner.Runner
-	logs    *logstore.Store
-	metrics Metrics
-	log     *slog.Logger
+	cfg      config.Config
+	store    store.Store
+	runner   runner.Runner
+	logs     *logstore.Store
+	metrics  Metrics
+	notifier Notifier
+	log      *slog.Logger
 
 	mu       sync.Mutex
 	running  map[string]*execution
@@ -102,6 +118,7 @@ func New(
 		runner:   run,
 		logs:     logs,
 		metrics:  nopMetrics{},
+		notifier: nopNotifier{},
 		log:      log,
 		running:  map[string]*execution{},
 		workers:  func() *config.Registry { return nil },
@@ -114,6 +131,11 @@ func (s *Supervisor) SetWorkers(workers func() *config.Registry) { s.workers = w
 
 // SetMetrics injects the observer fed by every attempt.
 func (s *Supervisor) SetMetrics(m Metrics) { s.metrics = m }
+
+// SetNotifier injects the component that reports settled outcomes. It is
+// injected rather than constructed here because a notification may itself run a
+// worker, which needs the scheduler the supervisor is built before.
+func (s *Supervisor) SetNotifier(n Notifier) { s.notifier = n }
 
 // SetOnSettle injects the callback invoked whenever an execution stops
 // occupying the node, whatever the outcome. The scheduler uses it to free the
@@ -228,7 +250,7 @@ func (s *Supervisor) startFailed(ctx context.Context, p *core.Process, worker *c
 		return err
 	}
 
-	s.settle(ctx, p, worker, config.RetryOnStartError, core.ReasonStartError)
+	event := s.settle(ctx, p, worker, config.RetryOnStartError, core.ReasonStartError)
 
 	if err := s.store.UpdateProcess(ctx, p); err != nil {
 		return err
@@ -236,6 +258,7 @@ func (s *Supervisor) startFailed(ctx context.Context, p *core.Process, worker *c
 
 	// An attempt that never became a process has an outcome but no duration.
 	s.metrics.AttemptFinished(p.Worker, string(p.State), 0)
+	s.notifier.Notify(event, p, worker)
 	s.onSettle(p)
 
 	return nil
@@ -307,7 +330,7 @@ func (s *Supervisor) finish(ctx context.Context, exec *execution, result runner.
 	p.Signal = result.Signal
 	p.LogTruncated = exec.logs.Truncated()
 
-	s.classify(ctx, exec, exec.intent, result)
+	event := s.classify(ctx, exec, exec.intent, result)
 
 	err := s.store.UpdateProcess(ctx, p)
 
@@ -318,6 +341,10 @@ func (s *Supervisor) finish(ctx context.Context, exec *execution, result runner.
 	}
 
 	s.metrics.AttemptFinished(p.Worker, string(p.State), p.Duration())
+
+	if event != "" {
+		s.notifier.Notify(event, p, exec.worker)
+	}
 
 	s.log.Info("execution finished",
 		slog.String("process", p.ID),
@@ -331,8 +358,14 @@ func (s *Supervisor) finish(ctx context.Context, exec *execution, result runner.
 	s.onSettle(p)
 }
 
-// classify moves the execution into the state its outcome implies.
-func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.Reason, result runner.Result) {
+// classify moves the execution into the state its outcome implies, and reports
+// which notification event that outcome is, or "" for one nobody asked about.
+func (s *Supervisor) classify(
+	ctx context.Context,
+	exec *execution,
+	intent core.Reason,
+	result runner.Result,
+) config.NotifyEvent {
 	p := exec.process
 	policy := retryPolicy(exec.worker)
 
@@ -347,26 +380,26 @@ func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.
 
 	switch intent {
 	case core.ReasonUserRequest:
+		// A human asked for this, so a human already knows.
 		s.transition(p, core.StateCanceled, core.ReasonUserRequest)
 		s.releaseLock(ctx, p)
 
-		return
+		return ""
 	case core.ReasonShutdown:
 		s.classifyShutdown(ctx, p, policy)
 
-		return
+		return ""
 	case core.ReasonTimeout:
 		if retry.Allowed(policy, config.RetryOnTimeout, p.Attempt) {
 			s.transition(p, core.StateCrashed, core.ReasonTimeout)
-			s.settle(ctx, p, exec.worker, config.RetryOnTimeout, core.ReasonTimeout)
 
-			return
+			return s.settle(ctx, p, exec.worker, config.RetryOnTimeout, core.ReasonTimeout)
 		}
 
 		s.transition(p, core.StateFailed, core.ReasonTimeout)
 		s.releaseLock(ctx, p)
 
-		return
+		return config.NotifyOnTimeout
 	default:
 		// Nothing asked this process to stop: classify what it reported.
 	}
@@ -378,7 +411,7 @@ func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.
 		s.transition(p, core.StateCompleted, "")
 		s.releaseLock(ctx, p)
 
-		return
+		return ""
 	}
 
 	// no_retry_exit_codes applies to both: an exit code that says "my
@@ -392,11 +425,12 @@ func (s *Supervisor) classify(ctx context.Context, exec *execution, intent core.
 		s.transition(p, core.StateFailed, core.ReasonNoRetryExit)
 		s.releaseLock(ctx, p)
 
-		return
+		return config.NotifyOnFailed
 	}
 
 	s.transition(p, core.StateCrashed, "")
-	s.settle(ctx, p, exec.worker, exitTrigger(p.Type, result), core.ReasonMaxAttempts)
+
+	return s.settle(ctx, p, exec.worker, exitTrigger(p.Type, result), core.ReasonMaxAttempts)
 }
 
 // exitTrigger names the failure class an ended attempt belongs to.
@@ -435,7 +469,7 @@ func (s *Supervisor) settle(
 	worker *config.Worker,
 	trigger config.RetryTrigger,
 	failureReason core.Reason,
-) {
+) config.NotifyEvent {
 	policy := retryPolicy(worker)
 
 	if p.StartedAt != nil && p.FinishedAt != nil && retry.CounterReset(policy, p.FinishedAt.Sub(*p.StartedAt)) {
@@ -446,7 +480,7 @@ func (s *Supervisor) settle(
 		s.transition(p, core.StateFailed, failureReason)
 		s.releaseLock(ctx, p)
 
-		return
+		return finalEvent(policy, trigger)
 	}
 
 	retryAt := time.Now().UTC().Add(retry.Delay(policy.Backoff, p.Attempt))
@@ -458,6 +492,28 @@ func (s *Supervisor) settle(
 		p.Restarts++
 		s.metrics.ServiceRestarted(p.Worker)
 	}
+
+	// Another attempt follows, so this is a crash and not a loss.
+	return config.NotifyOnCrashed
+}
+
+// finalEvent names the outcome of an execution that will not be retried again.
+//
+// The events do not overlap: `crashed` is "an attempt failed and another
+// follows", and these three are "it is over". A worker that wants both
+// subscribes to both, and still gets one notification per outcome.
+func finalEvent(policy config.Retry, trigger config.RetryTrigger) config.NotifyEvent {
+	if trigger == config.RetryOnTimeout {
+		return config.NotifyOnTimeout
+	}
+
+	// Without a retry policy there was no budget to exhaust: the first failure
+	// is simply the failure.
+	if policy.IsEnabled() {
+		return config.NotifyOnRetriesExhausted
+	}
+
+	return config.NotifyOnFailed
 }
 
 // transition applies a state change, logging the ones the state machine does

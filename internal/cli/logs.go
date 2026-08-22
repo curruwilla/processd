@@ -26,11 +26,13 @@ func newLogsCommand() *cobra.Command {
 				values.Set("tail", strconv.Itoa(tail))
 			}
 
+			node := mustString(cmd, "node")
+
 			if mustBool(cmd, "follow") {
-				return followLogs(cmd, args[0], values)
+				return followLogs(cmd, node, args[0], values)
 			}
 
-			return printLogs(cmd, args[0], values)
+			return printLogs(cmd, node, args[0], values)
 		},
 	}
 
@@ -38,13 +40,14 @@ func newLogsCommand() *cobra.Command {
 	cmd.Flags().Int("attempt", 0, "attempt to read, defaults to the last one")
 	cmd.Flags().Int("tail", 0, "show only the last N lines")
 	cmd.Flags().BoolP("follow", "f", false, "keep printing new output until the attempt ends")
+	cmd.Flags().String("node", "", "read from this fleet node instead of the one being addressed")
 
 	return cmd
 }
 
 // printLogs writes what the attempt has already produced.
-func printLogs(cmd *cobra.Command, id string, values url.Values) error {
-	path := query("/v1/processes/"+url.PathEscape(id)+"/logs", values)
+func printLogs(cmd *cobra.Command, node, id string, values url.Values) error {
+	path := nodePath(node, query("/v1/processes/"+url.PathEscape(id)+"/logs", values))
 
 	var body struct {
 		Lines     []string `json:"lines"`
@@ -70,8 +73,8 @@ func printLogs(cmd *cobra.Command, id string, values url.Values) error {
 //
 // Captured stderr is written to stderr, so that piping the command keeps the
 // same separation the execution itself had.
-func followLogs(cmd *cobra.Command, id string, values url.Values) error {
-	path := query("/v1/processes/"+url.PathEscape(id)+"/logs/stream", values)
+func followLogs(cmd *cobra.Command, node, id string, values url.Values) error {
+	path := nodePath(node, query("/v1/processes/"+url.PathEscape(id)+"/logs/stream", values))
 
 	return newClient().stream(cmd.Context(), path, func(event, data string) error {
 		switch event {

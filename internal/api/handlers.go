@@ -19,7 +19,6 @@ import (
 	"github.com/curruwilla/processd/internal/config"
 	"github.com/curruwilla/processd/internal/core"
 	"github.com/curruwilla/processd/internal/logstore"
-	"github.com/curruwilla/processd/internal/retry"
 	"github.com/curruwilla/processd/internal/runner"
 	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/version"
@@ -138,10 +137,32 @@ func (s *Server) listWorkers(w http.ResponseWriter, r *http.Request) {
 			Command:      worker.Command,
 			Params:       params,
 			MaxProcesses: worker.MaxProcesses,
+			Schedule:     s.scheduleOf(worker.Name),
 		})
 	}
 
 	writeJSON(w, s.log, http.StatusOK, workers)
+}
+
+// scheduleOf reports a worker's schedule, or nil when it has none.
+func (s *Server) scheduleOf(worker string) *scheduleResponse {
+	if s.schedules == nil {
+		return nil
+	}
+
+	status, ok := s.schedules.Status(worker)
+	if !ok {
+		return nil
+	}
+
+	return &scheduleResponse{
+		Cron:         status.Cron,
+		Timezone:     status.Timezone,
+		NextRun:      status.NextRun,
+		LastFiredAt:  status.LastFiredAt,
+		LastMissedAt: status.LastMissedAt,
+		MissedRuns:   status.MissedRuns,
+	}
 }
 
 func (s *Server) reloadWorkers(w http.ResponseWriter, r *http.Request) {
@@ -163,6 +184,14 @@ func (s *Server) createProcess(w http.ResponseWriter, r *http.Request) {
 	var req createProcessRequest
 	if err := decodeJSON(body, &req); err != nil {
 		writeError(w, s.log, err)
+		return
+	}
+
+	// A named node is dispatched rather than executed here. The hub keeps no
+	// authoritative copy of what it forwarded: the execution belongs to the node
+	// that runs it, which is what keeps this a router and not a scheduler.
+	if req.Node != "" {
+		s.dispatchToNode(w, r, req.Node, body)
 		return
 	}
 
@@ -212,15 +241,15 @@ func (s *Server) buildProcess(r *http.Request, req createProcessRequest) (*core.
 		return nil, fmt.Errorf("type %q: %w", req.Type, core.ErrUnsupportedType)
 	}
 
-	process := &core.Process{
-		ID:        core.NewProcessID(),
-		Type:      core.TypeTask,
-		State:     core.StateCreated,
-		Metadata:  req.Metadata,
-		CreatedAt: time.Now().UTC(),
-	}
-
 	if req.Command != "" {
+		process := &core.Process{
+			ID:        core.NewProcessID(),
+			Type:      core.TypeTask,
+			State:     core.StateCreated,
+			Metadata:  req.Metadata,
+			CreatedAt: time.Now().UTC(),
+		}
+
 		if err := s.applyRawCommand(process, req); err != nil {
 			return nil, err
 		}
@@ -232,11 +261,7 @@ func (s *Server) buildProcess(r *http.Request, req createProcessRequest) (*core.
 		return nil, badRequest("worker_required", "worker must be set")
 	}
 
-	if err := s.applyWorker(r, process, req); err != nil {
-		return nil, err
-	}
-
-	return process, nil
+	return s.buildFromWorker(r, req)
 }
 
 // applyRawCommand handles execution_mode: raw. A client-chosen command is
@@ -268,10 +293,14 @@ func (s *Server) applyRawCommand(process *core.Process, req createProcessRequest
 	return nil
 }
 
-func (s *Server) applyWorker(r *http.Request, process *core.Process, req createProcessRequest) error {
+// buildFromWorker resolves a request against a loaded worker. Everything that
+// depends on the request — the token, the declared type, the allowed overrides
+// — is checked here; turning the template into an execution is the worker's own
+// job, so that a scheduled firing produces the same definition.
+func (s *Server) buildFromWorker(r *http.Request, req createProcessRequest) (*core.Process, error) {
 	token, _ := tokenFrom(r.Context())
 	if !token.AllowsWorker(req.Worker) {
-		return &apiError{
+		return nil, &apiError{
 			Status:  http.StatusForbidden,
 			Code:    "worker_forbidden",
 			Message: fmt.Sprintf("token %q may not use worker %q", token.Name, req.Worker),
@@ -280,41 +309,35 @@ func (s *Server) applyWorker(r *http.Request, process *core.Process, req createP
 
 	worker, err := s.scheduler.Registry().Get(req.Worker)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if !worker.IsEnabled() {
-		return fmt.Errorf("%q: %w", worker.Name, core.ErrWorkerDisabled)
-	}
-
-	resolved, err := worker.Resolve(req.Params)
-	if err != nil {
-		return err
+		return nil, fmt.Errorf("%q: %w", worker.Name, core.ErrWorkerDisabled)
 	}
 
 	// The worker definition decides what kind of execution this is. A request
 	// may state the type, but only to agree with it: running a service worker as
 	// a task would silently drop its restart policy.
 	if req.Type != "" && req.Type != worker.Type {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"worker %q is a %s, not a %s: %w",
 			worker.Name, worker.Type, req.Type, core.ErrUnsupportedType,
 		)
 	}
 
-	process.Type = worker.Type
-	process.Worker = worker.Name
-	process.Command = worker.Command
-	process.Args = resolved.Args
-	process.Cwd = worker.Cwd
-	process.User = worker.User
-	process.Group = worker.Group
-	process.Lock = resolved.Lock
-	process.Timeout = worker.Timeout.Duration()
-	process.MaxAttempts = retry.Attempts(worker.Retry)
-	process.Env = maps.Clone(worker.Env)
+	process, err := worker.Instantiate(req.Params)
+	if err != nil {
+		return nil, err
+	}
 
-	return applyOverrides(process, worker, req)
+	process.Metadata = req.Metadata
+
+	if err := applyOverrides(process, worker, req); err != nil {
+		return nil, err
+	}
+
+	return process, nil
 }
 
 // applyOverrides applies the request fields a worker explicitly allows to be
@@ -373,6 +396,13 @@ func (s *Server) getProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request) {
+	// A hub answers the same endpoint about other nodes when asked to, so that a
+	// client reads one API whether or not there is a fleet behind it.
+	if node := r.URL.Query().Get("node"); node != "" && s.fleet != nil {
+		s.listFleetProcesses(w, r, node)
+		return
+	}
+
 	filter, err := parseFilter(r)
 	if err != nil {
 		writeError(w, s.log, err)

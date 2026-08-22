@@ -19,7 +19,7 @@ func newStopCommand() *cobra.Command {
 				values.Set("grace", grace)
 			}
 
-			path := query("/v1/processes/"+url.PathEscape(args[0]), values)
+			path := nodePath(mustString(cmd, "node"), query("/v1/processes/"+url.PathEscape(args[0]), values))
 
 			if err := newClient().do(cmd.Context(), "DELETE", path, nil, nil); err != nil {
 				return err
@@ -32,6 +32,7 @@ func newStopCommand() *cobra.Command {
 	}
 
 	cmd.Flags().String("grace", "", "how long to wait before SIGKILL, e.g. 15s")
+	cmd.Flags().String("node", "", "act on this fleet node instead of the one being addressed")
 
 	return cmd
 }

@@ -43,6 +43,10 @@ internal/queue/      admission, slots, backoff
 internal/supervisor/ per-execution supervision
 internal/runner/     exec, process groups, signals, /proc fingerprinting (Linux only)
 internal/logstore/   per-attempt capped log files, tail and follow
+internal/cron/       five-field cron parsing and Next(); no goroutine, no I/O
+internal/schedule/   the firing loop for `schedule:` workers
+internal/notify/     outbound failure notifications: webhook and worker
+internal/fleet/      reads other nodes: poller, proxy; never writes
 internal/metrics/    Prometheus text-format counters and histograms
 internal/webui/      embedded web console (go:embed)
 internal/store/      persistence interface + SQLite implementation
@@ -60,3 +64,8 @@ internal/store/      persistence interface + SQLite implementation
 - **The store is the source of truth**; in-memory state is a cache rebuilt on startup.
 - **State transitions go through the table in `internal/core/state.go`** — an undefined edge is a bug
   to report, not to silently allow.
+- **A hub reads; it never decides.** It aggregates and proxies, keeps no authoritative copy of a
+  remote execution, and dispatches only to the node the client named. Distributed scheduling —
+  placement, replicas, failover — is a declared non-goal, not a later phase.
+- **A node that did not answer has not said no.** Silence from a remote node is reported as unknown,
+  never as a failure, and is never a reason to reschedule anything.

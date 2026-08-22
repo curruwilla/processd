@@ -678,3 +678,164 @@ func TestSupervisor_Stop_retryingService(t *testing.T) {
 		t.Fatal("the scheduler was never told the service settled")
 	}
 }
+
+// recordingNotifier collects the events the supervisor raised.
+type recordingNotifier struct {
+	mu     sync.Mutex
+	events []config.NotifyEvent
+}
+
+func (r *recordingNotifier) Notify(event config.NotifyEvent, _ *core.Process, _ *config.Worker) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.events = append(r.events, event)
+}
+
+func (r *recordingNotifier) all() []config.NotifyEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]config.NotifyEvent(nil), r.events...)
+}
+
+// One outcome raises exactly one event, and it is the most specific one that
+// describes it: `crashed` means another attempt follows, and the other three
+// mean it is over.
+func TestSupervisor_notifiesTheOutcome(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		worker  string
+		command string
+		want    config.NotifyEvent
+	}{
+		{
+			name:    "a failure with a retry left is a crash",
+			worker:  "flaky",
+			command: "/bin/false",
+			want:    config.NotifyOnCrashed,
+		},
+		{
+			name:    "a failure with no retry policy is just a failure",
+			worker:  "doomed",
+			command: "/bin/false",
+			want:    config.NotifyOnFailed,
+		},
+		{
+			name:    "a no_retry_exit_code is a failure, not an exhausted budget",
+			worker:  "fatal-task",
+			command: "/bin/false",
+			want:    config.NotifyOnFailed,
+		},
+		{
+			name:    "a start error still reports",
+			worker:  "doomed",
+			command: "/bin/does-not-exist",
+			want:    config.NotifyOnFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t, nil)
+			notifier := &recordingNotifier{}
+			h.supervisor.SetNotifier(notifier)
+
+			h.start(t, "proc_"+tt.worker+tt.name, tt.worker, tt.command, nil)
+			h.awaitFinish(t)
+
+			events := notifier.all()
+			if len(events) != 1 {
+				t.Fatalf("raised %v, want exactly one event", events)
+			}
+
+			if events[0] != tt.want {
+				t.Fatalf("event = %q, want %q", events[0], tt.want)
+			}
+		})
+	}
+}
+
+// A success is nobody's incident.
+func TestSupervisor_doesNotNotifyASuccess(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, nil)
+	notifier := &recordingNotifier{}
+	h.supervisor.SetNotifier(notifier)
+
+	h.start(t, "proc_quiet", "hello", "/bin/echo", []string{"hello"})
+	h.awaitFinish(t)
+
+	if events := notifier.all(); len(events) != 0 {
+		t.Fatalf("raised %v for a completed execution, want nothing", events)
+	}
+}
+
+// A stop asked for by a human needs no notification: the human is the trigger.
+func TestSupervisor_doesNotNotifyAUserStop(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, nil)
+	notifier := &recordingNotifier{}
+	h.supervisor.SetNotifier(notifier)
+
+	h.start(t, "proc_stopped", "sleeper", "/bin/sleep", []string{"30"})
+
+	if err := h.supervisor.Stop(t.Context(), "proc_stopped", time.Second); err != nil {
+		t.Fatalf("Stop() returned %v, want nil", err)
+	}
+
+	h.awaitFinish(t)
+
+	if events := notifier.all(); len(events) != 0 {
+		t.Fatalf("raised %v for a user stop, want nothing", events)
+	}
+}
+
+func TestFinalEvent(t *testing.T) {
+	t.Parallel()
+
+	enabled := config.Retry{Enabled: config.Bool(true)}
+	disabled := config.Retry{}
+
+	tests := []struct {
+		name    string
+		policy  config.Retry
+		trigger config.RetryTrigger
+		want    config.NotifyEvent
+	}{
+		{
+			name:    "a deadline is reported as a timeout whatever the policy",
+			policy:  enabled,
+			trigger: config.RetryOnTimeout,
+			want:    config.NotifyOnTimeout,
+		},
+		{
+			name:    "a spent budget",
+			policy:  enabled,
+			trigger: config.RetryOnNonZeroExit,
+			want:    config.NotifyOnRetriesExhausted,
+		},
+		{
+			name:    "no budget to spend",
+			policy:  disabled,
+			trigger: config.RetryOnNonZeroExit,
+			want:    config.NotifyOnFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := finalEvent(tt.policy, tt.trigger); got != tt.want {
+				t.Fatalf("finalEvent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

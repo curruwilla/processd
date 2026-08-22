@@ -8,12 +8,12 @@ import (
 )
 
 func newSignalCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "signal <id> <signal>",
 		Short: "Send a signal to a running execution",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path := "/v1/processes/" + url.PathEscape(args[0]) + "/signal"
+			path := nodePath(mustString(cmd, "node"), "/v1/processes/"+url.PathEscape(args[0])+"/signal")
 			body := map[string]string{"signal": args[1]}
 
 			if err := newClient().do(cmd.Context(), "POST", path, body, nil); err != nil {
@@ -25,4 +25,8 @@ func newSignalCommand() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().String("node", "", "act on this fleet node instead of the one being addressed")
+
+	return cmd
 }

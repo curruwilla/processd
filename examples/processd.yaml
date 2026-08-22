@@ -32,6 +32,30 @@ logs:
   max_bytes_per_stream: 32MiB
   retention: 14d
 
+# Fallback notification policy (SPEC §5.5). A worker that declares `notify` of
+# its own replaces this one outright rather than merging with it.
+# notify:
+#   on: [retries_exhausted, timeout]
+#   webhook:
+#     url: https://hooks.example.com/processd
+#     timeout: 5s
+#     retry: 2
+
+# Reading other nodes turns this daemon into a hub (SPEC §6.10). It aggregates
+# their read API and proxies reads to them, and never writes to one. Nothing is
+# configured on the nodes themselves: the hub polls, so a node does not know it
+# is being read. Leave this out on an ordinary node — the fleet routes are then
+# absent rather than empty.
+# fleet:
+#   poll_interval: 10s
+#   timeout: 5s
+#   nodes:
+#     - name: app-01
+#       url: https://10.0.0.11:7373
+#       # Absolute path to a read_only token for that node. There is deliberately
+#       # no inline token: this file stores digests, never secrets.
+#       token_file: /etc/processd/nodes/app-01.token
+
 # The web console at /ui/. Static assets only: the page asks for a token and
 # calls the same authenticated API as any other client.
 ui:
@@ -43,3 +67,9 @@ auth:
     - name: billing-cron
       hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
       workers: ["invoice-process"]
+
+    # read_only refuses every state-changing call with this token. It is what a
+    # hub uses to read this node, and what a dashboard should be given.
+    # - name: hub
+    #   hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    #   read_only: true

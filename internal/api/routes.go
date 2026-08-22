@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -30,6 +31,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/workers", s.listWorkers)
 	mux.HandleFunc("POST /v1/reload", s.reloadWorkers)
 
+	s.mountFleet(mux)
+
 	mux.HandleFunc("GET /v1/health", s.health)
 	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/metrics", s.metrics)
@@ -37,6 +40,27 @@ func (s *Server) Handler() http.Handler {
 	s.mountUI(mux)
 
 	return s.recoverPanics(s.logRequests(s.authenticate(mux)))
+}
+
+// mountFleet adds the aggregation routes, and only on a hub.
+//
+// A daemon that aggregates nothing does not answer them at all: the routes are
+// absent rather than empty, so nothing suggests a fleet where there is none.
+//
+// Writes are proxied as well as reads, but only ever to the node the client
+// named: the hub forwards, it never chooses. Whether a hub may write at all is
+// the operator's decision and is made by which token they install for each node
+// — a read_only one and the node refuses, whatever the hub was asked to do.
+func (s *Server) mountFleet(mux *http.ServeMux) {
+	if s.fleet == nil {
+		return
+	}
+
+	mux.HandleFunc("GET /v1/fleet/nodes", s.listFleetNodes)
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		mux.HandleFunc(method+" /v1/fleet/nodes/{node}/{path...}", s.proxyToNode)
+	}
 }
 
 // mountUI serves the console and sends the bare root to it, so that opening the
@@ -89,8 +113,31 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
+		// A read-only token may look at anything it is allowed to see and change
+		// nothing. Every state-changing route in the API is a non-safe method,
+		// so the rule is the method, not a list that a new route could fall off.
+		if token.ReadOnly && !isSafeMethod(r.Method) {
+			writeError(w, s.log, &apiError{
+				Status:  http.StatusForbidden,
+				Code:    "read_only_token",
+				Message: fmt.Sprintf("token %q is read-only and may not %s", token.Name, r.Method),
+			})
+
+			return
+		}
+
 		next.ServeHTTP(w, withToken(r, token))
 	})
+}
+
+// isSafeMethod reports whether a method only reads.
+func isSafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 // logRequests emits one structured line per request. The message stays constant

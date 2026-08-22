@@ -38,6 +38,18 @@ type Idempotency struct {
 	CreatedAt   time.Time
 }
 
+// ScheduleState is what a worker's schedule remembers across daemon restarts.
+//
+// The instants it holds are occurrences, not wall-clock events: LastFiredAt is
+// the scheduled time an execution was created for, so that jitter and dispatch
+// delay never shift the grid the next occurrence is computed from.
+type ScheduleState struct {
+	Worker       string
+	LastFiredAt  *time.Time
+	LastMissedAt *time.Time
+	MissedRuns   int
+}
+
 // AuditEntry records who asked for what. It is written for every state-changing
 // API call, so that an execution can always be traced back to a token.
 type AuditEntry struct {
@@ -111,6 +123,12 @@ type Store interface {
 	SaveIdempotency(ctx context.Context, record Idempotency) error
 	// FindIdempotency returns a stored key, or core.ErrNotFound.
 	FindIdempotency(ctx context.Context, key string) (Idempotency, error)
+
+	// LoadSchedules returns the persisted state of every worker schedule. It is
+	// read at startup and after a reload, never on the firing path.
+	LoadSchedules(ctx context.Context) (map[string]ScheduleState, error)
+	// SaveSchedule records that a schedule fired, or that it missed.
+	SaveSchedule(ctx context.Context, state ScheduleState) error
 
 	AppendAudit(ctx context.Context, entry AuditEntry) error
 

@@ -17,10 +17,13 @@ import (
 
 	"github.com/curruwilla/processd/internal/api"
 	"github.com/curruwilla/processd/internal/config"
+	"github.com/curruwilla/processd/internal/fleet"
 	"github.com/curruwilla/processd/internal/logstore"
 	"github.com/curruwilla/processd/internal/metrics"
+	"github.com/curruwilla/processd/internal/notify"
 	"github.com/curruwilla/processd/internal/queue"
 	"github.com/curruwilla/processd/internal/runner"
+	"github.com/curruwilla/processd/internal/schedule"
 	"github.com/curruwilla/processd/internal/store"
 	"github.com/curruwilla/processd/internal/store/sqlite"
 	"github.com/curruwilla/processd/internal/supervisor"
@@ -33,6 +36,13 @@ const databaseFile = "processd.db"
 // garbageInterval is how often the retention limits are enforced.
 const garbageInterval = time.Hour
 
+// notifyDrainBudget is how long shutdown waits for queued notifications.
+//
+// The same reasoning as apiShutdownBudget: the configured grace exists for the
+// supervised processes, and an unreachable webhook must not hold the node up
+// for tens of seconds on the way down.
+const notifyDrainBudget = 5 * time.Second
+
 // Daemon is the assembled application.
 type Daemon struct {
 	cfg config.Config
@@ -42,6 +52,9 @@ type Daemon struct {
 	logs       *logstore.Store
 	supervisor *supervisor.Supervisor
 	scheduler  *queue.Scheduler
+	schedules  *schedule.Runner
+	notifier   *notify.Notifier
+	fleet      *fleet.Fleet
 	api        *api.Server
 }
 
@@ -77,6 +90,17 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	sup.SetWorkers(scheduler.Registry)
 	sup.SetOnSettle(scheduler.OnExecutionSettled)
 
+	if err := validateNotifyTarget(cfg.Notify, registry); err != nil {
+		return nil, err
+	}
+
+	// nil unless this daemon is a hub, which is what keeps the aggregation
+	// routes off an ordinary node entirely.
+	aggregate, err := fleet.New(cfg.Fleet, log)
+	if err != nil {
+		return nil, err
+	}
+
 	d := &Daemon{
 		cfg:        cfg,
 		log:        log,
@@ -84,7 +108,21 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 		logs:       logs,
 		supervisor: sup,
 		scheduler:  scheduler,
+		schedules:  schedule.New(scheduler.Registry, scheduler, db, log),
+		fleet:      aggregate,
+		notifier: notify.New(notify.Options{
+			Fallback: cfg.Notify,
+			Workers:  scheduler.Registry,
+			Submit:   scheduler,
+			Logs:     logs,
+			Node:     nodeName(log),
+			Logger:   log,
+		}),
 	}
+
+	// Injected rather than constructed inside the supervisor: a notification may
+	// run a worker, which needs the scheduler the supervisor is built before.
+	sup.SetNotifier(d.notifier)
 
 	console, err := buildConsole(cfg)
 	if err != nil {
@@ -100,6 +138,8 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 		Metrics:    observed,
 		Logger:     log,
 		Reload:     d.Reload,
+		Schedules:  d.schedules,
+		Fleet:      d.fleet,
 		UI:         console,
 	})
 
@@ -110,6 +150,44 @@ func New(cfg config.Config, log *slog.Logger) (*Daemon, error) {
 	log.Info("workers loaded", slog.Int("count", registry.Len()))
 
 	return d, nil
+}
+
+// validateNotifyTarget refuses a daemon-wide notification pointing at a worker
+// that is not there.
+//
+// A worker's own policy is checked when workers.d loads; the daemon-wide one
+// cannot be, because the two files are read separately. Fail closed at boot
+// rather than discover it on the first failure it was meant to report.
+func validateNotifyTarget(policy config.Notify, registry *config.Registry) error {
+	if policy.Exec == nil {
+		return nil
+	}
+
+	target, err := registry.Get(policy.Exec.Worker)
+	if err != nil {
+		return fmt.Errorf("notify.exec.worker: %w", err)
+	}
+
+	if target.Notify.IsSet() {
+		return fmt.Errorf(
+			"notify.exec.worker %q declares notify of its own, which would notify about notifications",
+			target.Name,
+		)
+	}
+
+	return nil
+}
+
+// nodeName labels notifications with the host that produced them, so a payload
+// arriving in a shared channel says which node it came from.
+func nodeName(log *slog.Logger) string {
+	name, err := os.Hostname()
+	if err != nil {
+		log.Warn("reading the hostname", slog.Any("error", err))
+		return "unknown"
+	}
+
+	return name
 }
 
 // buildConsole returns the console handler, or nil when the operator turned the
@@ -130,6 +208,7 @@ func (d *Daemon) Reload(ctx context.Context) error {
 	}
 
 	d.scheduler.SetRegistry(registry)
+	d.schedules.Reload()
 	d.log.Info("workers reloaded", slog.Int("count", registry.Len()))
 
 	return nil
@@ -164,6 +243,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	})
 
+	wg.Go(func() {
+		if err := d.schedules.Run(ctx); err != nil {
+			d.log.Error("schedule runner stopped", slog.Any("error", err))
+		}
+	})
+
+	wg.Go(func() {
+		if err := d.notifier.Run(ctx); err != nil {
+			d.log.Error("notifier stopped", slog.Any("error", err))
+		}
+	})
+
+	if d.fleet != nil {
+		wg.Go(func() {
+			if err := d.fleet.Run(ctx); err != nil {
+				d.log.Error("fleet poller stopped", slog.Any("error", err))
+			}
+		})
+	}
+
 	grace := d.cfg.ShutdownGrace.Duration()
 
 	err := d.api.Serve(ctx, grace)
@@ -173,6 +272,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if shutdownErr := d.supervisor.Shutdown(context.WithoutCancel(ctx), grace); shutdownErr != nil {
 		err = errors.Join(err, fmt.Errorf("stopping executions: %w", shutdownErr))
 	}
+
+	// After the supervisor, so the outcomes it settled on the way down are still
+	// reported, and before the wait, so the notifier has something to return on.
+	d.notifier.Close(notifyDrainBudget)
 
 	wg.Wait()
 

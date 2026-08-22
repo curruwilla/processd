@@ -24,6 +24,12 @@ func newRunCommand() *cobra.Command {
 				request["lock"] = lock
 			}
 
+			// On a hub, naming a node runs the worker there. The node is the
+			// client's choice: the hub never picks one.
+			if node := mustString(cmd, "node"); node != "" {
+				request["node"] = node
+			}
+
 			var created struct {
 				ID     string `json:"id"`
 				Status string `json:"status"`
@@ -42,6 +48,7 @@ func newRunCommand() *cobra.Command {
 
 	cmd.Flags().StringSlice("param", nil, "worker parameter as name=value, repeatable")
 	cmd.Flags().String("lock", "", "lock key, when the worker allows overriding it")
+	cmd.Flags().String("node", "", "run on this fleet node instead of the one being addressed")
 
 	return cmd
 }

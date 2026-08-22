@@ -20,6 +20,10 @@ func TestConsole_readsTheDocumentedFields(t *testing.T) {
 		// GET /v1/processes
 		"item.type", "item.restarts", "item.retry_at", "item.duration_ms",
 		"item.max_attempts", "item.log_truncated",
+		// GET /v1/workers
+		"schedule.cron", "schedule.next_run", "schedule.missed_runs",
+		// GET /v1/fleet/nodes, and the fleet listing
+		"fleet/nodes", "node.reachable", "node.last_seen", "page.unreachable", "item.node",
 	}
 
 	body := fetch(t, "/app.js")

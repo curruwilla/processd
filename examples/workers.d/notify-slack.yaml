@@ -1,0 +1,44 @@
+# Example notification target. A worker named by `notify.exec` receives the
+# outcome through declared params, like every other execution: nothing reaches a
+# process that the worker did not declare, notifications included.
+#
+# The values a notification can carry are:
+#   event        failed | crashed | retries_exhausted | timeout
+#   process_id   the execution that ended badly
+#   worker       the worker it came from
+#   state        FAILED, RETRYING, ...
+#   reason       max_attempts, timeout, no_retry_exit_code, ...
+#   attempt      which attempt ended
+#   exit_code    absent when the process never started
+#   signal       empty unless it was signalled
+#   node         the hostname of this node
+#
+# Declare the ones you want and ignore the rest. A `required: true` param that
+# is not on that list is refused at load: a notification has nobody to ask.
+version: 1
+workers:
+  - name: notify-slack
+    type: task
+
+    command: /usr/local/bin/post-to-slack
+    args:
+      - "--channel=#alerts"
+      - "--node={{node}}"
+      - "--text={{worker}} {{event}} ({{state}}/{{reason}}) exit={{exit_code}} id={{process_id}}"
+
+    params:
+      node: {}
+      worker: {}
+      event: {}
+      state: {}
+      reason: {}
+      process_id: {}
+      exit_code: { default: "-" }
+
+    cwd: /
+    user: www-data
+    timeout: 30s
+
+    # A notification worker must not declare `notify` of its own: a notifier
+    # that notifies about its own failure is a loop with no bound, and the
+    # loader refuses it.
